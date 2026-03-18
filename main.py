@@ -102,7 +102,7 @@ def setup_flow(store: ProfileStore) -> None:
         print(f"  Папка: {stats.folder_name}")
         print(f"  Создана сейчас: {'Да' if stats.folder_created else 'Нет (уже существовала)'}")
     except (AdsApiError, PcloudAutomationError) as exc:
-        print(f"Ошибка настройки: {exc}")
+        print(f"\nНе получилось выполнить настройку: {exc}")
 
 
 def send_flow(store: ProfileStore) -> None:
@@ -118,7 +118,7 @@ def send_flow(store: ProfileStore) -> None:
         print(f"  Отправлено: {stats.sent_emails}")
         print(f"  Ошибочных батчей: {stats.failed_batches}")
     except (AdsApiError, PcloudAutomationError) as exc:
-        print(f"Ошибка запуска: {exc}")
+        print(f"\nНе получилось выполнить отправку: {exc}")
 
 
 def show_menu() -> None:

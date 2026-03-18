@@ -21,7 +21,7 @@ ADS_MAX_RETRIES_PER_URL = 2
 # pCloud automation defaults
 DEFAULT_PCLOUD_URL = "https://my.pcloud.com/"
 BATCH_SIZE = 20
-BATCH_DELAY_SECONDS = 1.0
+BATCH_DELAY_SECONDS = 0.6
 
 # Files and directories
 EDIT_DIR_CANDIDATES = [BASE_DIR / "edit", BASE_DIR / "EDIT"]
