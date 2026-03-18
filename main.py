@@ -5,7 +5,12 @@ from typing import Iterable
 
 from ads_api import AdsApiError
 from config import DEFAULT_PCLOUD_URL
-from pcloud_automation import PcloudAutomationError, ensure_input_files, run_job
+from pcloud_automation import (
+    PcloudAutomationError,
+    ensure_input_files,
+    send_invites,
+    setup_folder,
+)
 from profile_store import Profile, ProfileStore
 
 
@@ -67,25 +72,47 @@ def delete_profile_flow(store: ProfileStore) -> None:
         print("Профиль не найден.")
 
 
-def run_flow(store: ProfileStore) -> None:
+def choose_profile(store: ProfileStore) -> Profile | None:
     profiles = list(store.list_profiles())
     print_profiles(profiles)
     if not profiles:
         print("Сначала добавьте профиль.")
-        return
+        return None
 
     selected = ask_int("Введите локальный ID профиля для запуска: ")
     if selected is None:
-        return
+        return None
 
     profile = store.get_profile(selected)
     if profile is None:
         print("Профиль не найден.")
+        return None
+    return profile
+
+
+def setup_flow(store: ProfileStore) -> None:
+    profile = choose_profile(store)
+    if profile is None:
         return
 
-    print("\nЗапускаю автоматизацию...")
+    print("\nЗапускаю настройку профиля (создание папки)...")
     try:
-        stats = run_job(profile)
+        stats = setup_folder(profile)
+        print("\nГотово:")
+        print(f"  Папка: {stats.folder_name}")
+        print(f"  Создана сейчас: {'Да' if stats.folder_created else 'Нет (уже существовала)'}")
+    except (AdsApiError, PcloudAutomationError) as exc:
+        print(f"Ошибка настройки: {exc}")
+
+
+def send_flow(store: ProfileStore) -> None:
+    profile = choose_profile(store)
+    if profile is None:
+        return
+
+    print("\nЗапускаю отправку email-приглашений...")
+    try:
+        stats = send_invites(profile)
         print("\nГотово:")
         print(f"  Всего email: {stats.total_emails}")
         print(f"  Отправлено: {stats.sent_emails}")
@@ -103,8 +130,9 @@ def show_menu() -> None:
         print("1. Добавить профиль ADS Browser")
         print("2. Показать профили")
         print("3. Удалить профиль")
-        print("4. Запустить создание folder + invite emails")
-        print("5. Выход")
+        print("4. Настройка профиля (создать папку)")
+        print("5. Отправка email + сообщения")
+        print("6. Выход")
         choice = input("\nВыберите действие: ").strip()
 
         if choice == "1":
@@ -114,8 +142,10 @@ def show_menu() -> None:
         elif choice == "3":
             delete_profile_flow(store)
         elif choice == "4":
-            run_flow(store)
+            setup_flow(store)
         elif choice == "5":
+            send_flow(store)
+        elif choice == "6":
             print("Выход.")
             break
         else:

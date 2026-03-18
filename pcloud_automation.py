@@ -4,7 +4,7 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable, TypeVar
 
 try:
     from playwright.sync_api import Locator, Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
@@ -40,6 +40,15 @@ class RunStats:
     total_emails: int
     sent_emails: int
     failed_batches: int
+
+
+@dataclass
+class SetupStats:
+    folder_name: str
+    folder_created: bool
+
+
+T = TypeVar("T")
 
 
 def _resolve_or_create_dir(candidates: list[Path]) -> Path:
@@ -134,16 +143,68 @@ class PcloudUi:
 
     def open_home(self, url: str) -> None:
         self.page.goto(url, wait_until="domcontentloaded", timeout=90_000)
-        self.page.wait_for_timeout(1500)
+        self.page.wait_for_load_state("networkidle", timeout=30_000)
+        self.page.wait_for_timeout(1200)
+
+    def _is_login_page(self) -> bool:
+        has_password = self.page.locator("input[type='password']").count() > 0
+        has_email = (
+            self.page.locator("input[type='email']").count() > 0
+            or self.page.locator("input[name*='mail' i]").count() > 0
+        )
+        return has_password and has_email
 
     def _visible_dialog(self) -> Locator:
         dialog = self.page.locator('div[role="dialog"]:visible, .modal:visible').last
         dialog.wait_for(state="visible", timeout=20_000)
         return dialog
 
-    def create_folder(self, folder_name: str) -> None:
-        add_button = self.page.get_by_role("button", name=re.compile(r"^Add$", re.I)).first
-        add_button.wait_for(state="visible", timeout=30_000)
+    def _folder_locator(self, folder_name: str) -> Locator:
+        escaped = re.escape(folder_name.strip())
+        return self.page.get_by_text(re.compile(rf"^\s*{escaped}\s*$")).first
+
+    def _ensure_folder_visible(self, folder_name: str, timeout: int = 20_000) -> Locator:
+        locator = self._folder_locator(folder_name)
+        locator.wait_for(state="visible", timeout=timeout)
+        return locator
+
+    def ensure_folder_exists(self, folder_name: str, timeout: int = 20_000) -> None:
+        self._ensure_folder_visible(folder_name, timeout=timeout)
+
+    def _find_add_button(self) -> Locator:
+        candidates = [
+            self.page.get_by_role("button", name=re.compile(r"^(Add|New|Создать)$", re.I)).first,
+            self.page.get_by_text(re.compile(r"^(Add|Создать)$", re.I)).first,
+            self.page.locator("button[aria-label*='add' i]").first,
+            self.page.locator("[role='button'][aria-label*='add' i]").first,
+            self.page.locator(".add-button, .create-button, .upload-btn").first,
+        ]
+        for candidate in candidates:
+            try:
+                candidate.wait_for(state="visible", timeout=4_000)
+                return candidate
+            except PlaywrightTimeoutError:
+                continue
+
+        current_url = self.page.url
+        if self._is_login_page():
+            raise PcloudAutomationError(
+                "Не найдена кнопка Add: похоже, в профиле ADS не выполнен вход в pCloud. "
+                f"Откройте профиль вручную и авторизуйтесь. URL: {current_url}"
+            )
+        raise PcloudAutomationError(
+            "Не удалось найти кнопку Add на странице pCloud. "
+            f"Проверьте, что открыта главная страница my.pcloud.com. URL: {current_url}"
+        )
+
+    def create_folder(self, folder_name: str) -> bool:
+        try:
+            self._ensure_folder_visible(folder_name, timeout=4_000)
+            return False
+        except PlaywrightTimeoutError:
+            pass
+
+        add_button = self._find_add_button()
         add_button.click()
 
         folder_menu_item = self.page.get_by_text(re.compile(r"^Folder$", re.I)).first
@@ -158,22 +219,45 @@ class PcloudUi:
         create_button = dialog.get_by_role("button", name=re.compile(r"Create|Save|OK", re.I)).first
         create_button.click()
 
-        folder_label = self.page.get_by_text(folder_name, exact=True).first
-        folder_label.wait_for(state="visible", timeout=25_000)
+        self._ensure_folder_visible(folder_name, timeout=25_000)
+        return True
 
-    def _open_folder_context_menu(self, folder_name: str) -> None:
-        folder_label = self.page.get_by_text(folder_name, exact=True).first
-        folder_label.wait_for(state="visible", timeout=25_000)
+    def _open_folder_context_menu(self, folder_name: str) -> Locator:
+        folder_label = self._ensure_folder_visible(folder_name, timeout=25_000)
         folder_label.scroll_into_view_if_needed()
         folder_label.click(button="right")
+        return folder_label
 
-    def invite_batch(self, folder_name: str, emails: list[str], message_text: str) -> None:
+    def _open_invite_dialog(self, folder_name: str) -> None:
+        folder_label = self._ensure_folder_visible(folder_name, timeout=20_000)
+        folder_label.scroll_into_view_if_needed()
+        folder_label.click()
+
+        toolbar_candidates = [
+            self.page.get_by_role("button", name=re.compile(r"Invite to Folder", re.I)).first,
+            self.page.get_by_text(re.compile(r"Invite to Folder", re.I)).first,
+            self.page.get_by_text(re.compile(r"Invite", re.I)).first,
+        ]
+        for candidate in toolbar_candidates:
+            try:
+                candidate.wait_for(state="visible", timeout=4_000)
+                candidate.click()
+                self._visible_dialog()
+                return
+            except PlaywrightTimeoutError:
+                continue
+            except Exception:  # noqa: BLE001
+                continue
+
         self._open_folder_context_menu(folder_name)
-
         invite_item = self.page.get_by_text(re.compile(r"Invite to Folder", re.I)).first
         invite_item.wait_for(state="visible", timeout=15_000)
         invite_item.click()
+        self._visible_dialog()
 
+    def invite_batch(self, folder_name: str, emails: list[str], message_text: str) -> None:
+        dialog = None
+        self._open_invite_dialog(folder_name)
         dialog = self._visible_dialog()
         email_input = dialog.locator("input[type='text'], input").first
         email_input.wait_for(state="visible", timeout=10_000)
@@ -200,26 +284,16 @@ class PcloudUi:
             self.page.wait_for_timeout(500)
 
 
-def run_job(profile: Profile) -> RunStats:
+def _run_in_ads_browser(profile: Profile, worker: Callable[[PcloudUi], T]) -> T:
     if sync_playwright is None:
         raise PcloudAutomationError(
             "Модуль playwright не установлен. Выполните: pip install -r requirements.txt"
         )
 
-    ensure_input_files()
-    folder_name, message_text, emails = load_job_data()
-
     ads_client = AdsApiClient()
     ads_session = None
-    sent_emails = 0
-    failed_batches = 0
-
-    batches = _chunked(emails, BATCH_SIZE)
 
     try:
-        _write_log(
-            f"Job started for profile={profile.ads_profile_id}; folder={folder_name}; emails={len(emails)}"
-        )
         ads_session = ads_client.start_browser(
             profile_id=profile.ads_profile_id,
             headless=ADS_HEADLESS,
@@ -233,19 +307,9 @@ def run_job(profile: Profile) -> RunStats:
 
             ui = PcloudUi(page)
             ui.open_home(profile.start_url or DEFAULT_PCLOUD_URL)
-            ui.create_folder(folder_name)
-
-            for batch in batches:
-                try:
-                    ui.invite_batch(folder_name, batch, message_text)
-                    sent_emails += len(batch)
-                    _write_log(f"Batch sent successfully: {len(batch)} emails")
-                except Exception as batch_exc:  # noqa: BLE001
-                    failed_batches += 1
-                    _write_log(f"Batch failed ({len(batch)} emails): {batch_exc}")
-                time.sleep(BATCH_DELAY_SECONDS)
-
+            result = worker(ui)
             browser.close()
+            return result
     except AdsApiError:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -253,11 +317,61 @@ def run_job(profile: Profile) -> RunStats:
     finally:
         if ads_session is not None:
             ads_client.stop_browser(ads_session.profile_id)
-        _write_log(
-            f"Job finished: total={len(emails)}, sent={sent_emails}, failed_batches={failed_batches}"
-        )
 
-    return RunStats(total_emails=len(emails), sent_emails=sent_emails, failed_batches=failed_batches)
+
+def setup_folder(profile: Profile) -> SetupStats:
+    ensure_input_files()
+    folder_name, _, _ = load_job_data()
+    _write_log(f"Setup started for profile={profile.ads_profile_id}; folder={folder_name}")
+
+    def worker(ui: PcloudUi) -> SetupStats:
+        created = ui.create_folder(folder_name)
+        return SetupStats(folder_name=folder_name, folder_created=created)
+
+    stats = _run_in_ads_browser(profile, worker)
+    _write_log(
+        f"Setup finished for profile={profile.ads_profile_id}; folder={stats.folder_name}; "
+        f"created={stats.folder_created}"
+    )
+    return stats
+
+
+def send_invites(profile: Profile) -> RunStats:
+    ensure_input_files()
+    folder_name, message_text, emails = load_job_data()
+    sent_emails = 0
+    failed_batches = 0
+    batches = _chunked(emails, BATCH_SIZE)
+    _write_log(
+        f"Send started for profile={profile.ads_profile_id}; folder={folder_name}; emails={len(emails)}"
+    )
+
+    def worker(ui: PcloudUi) -> RunStats:
+        nonlocal sent_emails, failed_batches
+        ui.ensure_folder_exists(folder_name, timeout=20_000)
+        for batch in batches:
+            try:
+                ui.invite_batch(folder_name, batch, message_text)
+                sent_emails += len(batch)
+                _write_log(f"Batch sent successfully: {len(batch)} emails")
+            except Exception as batch_exc:  # noqa: BLE001
+                failed_batches += 1
+                _write_log(f"Batch failed ({len(batch)} emails): {batch_exc}")
+            time.sleep(BATCH_DELAY_SECONDS)
+
+        return RunStats(total_emails=len(emails), sent_emails=sent_emails, failed_batches=failed_batches)
+
+    stats = _run_in_ads_browser(profile, worker)
+    _write_log(
+        f"Send finished for profile={profile.ads_profile_id}; total={stats.total_emails}; "
+        f"sent={stats.sent_emails}; failed_batches={stats.failed_batches}"
+    )
+    return stats
+
+
+def run_job(profile: Profile) -> RunStats:
+    setup_folder(profile)
+    return send_invites(profile)
 
 
 def _write_log(message: str) -> None:
