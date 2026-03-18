@@ -141,9 +141,32 @@ class PcloudUi:
     def __init__(self, page: Page) -> None:
         self.page = page
 
+    def force_desktop_view(self) -> None:
+        # Some ADS profiles open with small/mobile viewport.
+        try:
+            self.page.set_viewport_size({"width": 1920, "height": 1080})
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            cdp = self.page.context.new_cdp_session(self.page)
+            window_data = cdp.send("Browser.getWindowForTarget")
+            window_id = window_data.get("windowId")
+            if window_id:
+                cdp.send(
+                    "Browser.setWindowBounds",
+                    {
+                        "windowId": window_id,
+                        "bounds": {"windowState": "maximized"},
+                    },
+                )
+        except Exception:  # noqa: BLE001
+            pass
+
     def open_home(self, url: str) -> None:
         self.page.goto(url, wait_until="domcontentloaded", timeout=90_000)
-        self.page.wait_for_load_state("networkidle", timeout=30_000)
+        # pCloud keeps background requests, so networkidle can hang forever.
+        self.page.wait_for_load_state("load", timeout=30_000)
+        self.page.wait_for_selector("body", timeout=20_000)
         self.page.wait_for_timeout(1200)
 
     def _is_login_page(self) -> bool:
@@ -169,12 +192,22 @@ class PcloudUi:
         return locator
 
     def ensure_folder_exists(self, folder_name: str, timeout: int = 20_000) -> None:
-        self._ensure_folder_visible(folder_name, timeout=timeout)
+        try:
+            self._ensure_folder_visible(folder_name, timeout=timeout)
+        except PlaywrightTimeoutError as exc:
+            raise PcloudAutomationError(
+                f'Папка "{folder_name}" не найдена. Сначала выполните пункт меню 4 '
+                "(Настройка профиля: создать папку)."
+            ) from exc
 
     def _find_add_button(self) -> Locator:
         candidates = [
             self.page.get_by_role("button", name=re.compile(r"^(Add|New|Создать)$", re.I)).first,
             self.page.get_by_text(re.compile(r"^(Add|Создать)$", re.I)).first,
+            self.page.locator("button:has-text('Add')").first,
+            self.page.locator("a:has-text('Add')").first,
+            self.page.locator("[role='button']:has-text('Add')").first,
+            self.page.locator("button:has-text('Создать')").first,
             self.page.locator("button[aria-label*='add' i]").first,
             self.page.locator("[role='button'][aria-label*='add' i]").first,
             self.page.locator(".add-button, .create-button, .upload-btn").first,
@@ -204,11 +237,17 @@ class PcloudUi:
         except PlaywrightTimeoutError:
             pass
 
-        add_button = self._find_add_button()
-        add_button.click()
+        try:
+            add_button = self._find_add_button()
+            add_button.click()
+        except Exception:  # noqa: BLE001
+            # Last resort: top-right click area where Add button is in desktop pCloud UI.
+            view = self.page.viewport_size or {"width": 1280, "height": 720}
+            self.page.mouse.click(view["width"] - 75, 48)
+            self.page.wait_for_timeout(700)
 
-        folder_menu_item = self.page.get_by_text(re.compile(r"^Folder$", re.I)).first
-        folder_menu_item.wait_for(state="visible", timeout=10_000)
+        folder_menu_item = self.page.get_by_text(re.compile(r"^(Folder|Папка)$", re.I)).first
+        folder_menu_item.wait_for(state="visible", timeout=12_000)
         folder_menu_item.click()
 
         dialog = self._visible_dialog()
@@ -292,6 +331,7 @@ def _run_in_ads_browser(profile: Profile, worker: Callable[[PcloudUi], T]) -> T:
 
     ads_client = AdsApiClient()
     ads_session = None
+    page: Page | None = None
 
     try:
         ads_session = ads_client.start_browser(
@@ -304,15 +344,25 @@ def _run_in_ads_browser(profile: Profile, worker: Callable[[PcloudUi], T]) -> T:
             browser = playwright.chromium.connect_over_cdp(ads_session.cdp_url)
             context = browser.contexts[0] if browser.contexts else browser.new_context()
             page = context.pages[0] if context.pages else context.new_page()
+            page.set_default_timeout(20_000)
 
             ui = PcloudUi(page)
+            ui.force_desktop_view()
             ui.open_home(profile.start_url or DEFAULT_PCLOUD_URL)
+            ui.force_desktop_view()
             result = worker(ui)
             browser.close()
             return result
     except AdsApiError:
         raise
     except Exception as exc:  # noqa: BLE001
+        if page is not None:
+            try:
+                LOGS_DIR.mkdir(parents=True, exist_ok=True)
+                page.screenshot(path=str(LOGS_DIR / "last_error.png"), full_page=True)
+                _write_log(f"Saved screenshot to {LOGS_DIR / 'last_error.png'}")
+            except Exception:  # noqa: BLE001
+                pass
         raise PcloudAutomationError(str(exc)) from exc
     finally:
         if ads_session is not None:
