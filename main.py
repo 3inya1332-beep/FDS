@@ -8,13 +8,18 @@ from config import DEFAULT_PCLOUD_URL
 from pcloud_automation import (
     InboxCheckStats,
     PcloudAutomationError,
+    add_proxy_rotation_url,
+    clear_proxy_rotation_urls,
     ensure_input_files,
     get_sent_emails,
     get_unsent_emails,
+    get_proxy_rotation_urls,
     inbox_check,
     refresh_email_data,
+    set_proxy_rotation_urls,
     send_invites,
     setup_folder,
+    test_proxy_rotation_once,
 )
 from profile_store import Profile, ProfileStore
 
@@ -58,6 +63,13 @@ def ask_email(prompt: str) -> str | None:
         return None
     if "@" not in value or "." not in value.split("@")[-1]:
         print("⚠️ Это не похоже на email.")
+        return None
+    return value
+
+
+def ask_text(prompt: str) -> str | None:
+    value = input(prompt).strip()
+    if not value:
         return None
     return value
 
@@ -177,6 +189,57 @@ def refresh_data_flow() -> None:
         print(f"\n❌ Не удалось обновить данные: {exc}")
 
 
+def proxy_settings_flow() -> None:
+    while True:
+        clear_console()
+        print("🔐 Настройки 9Proxy")
+        print("1. Показать API URL")
+        print("2. Задать один API URL (заменить список)")
+        print("3. Добавить API URL в список")
+        print("4. Очистить список API URL")
+        print("5. Проверка смены прокси (1 раз)")
+        print("6. Назад")
+        choice = input("\nВыберите действие: ").strip()
+
+        if choice == "1":
+            urls = get_proxy_rotation_urls()
+            print("\nТекущие API URL для ротации:")
+            if not urls:
+                print("  (пусто)")
+            else:
+                for idx, url in enumerate(urls, start=1):
+                    print(f"  {idx}. {url}")
+        elif choice == "2":
+            url = ask_text("Вставьте API URL 9Proxy: ")
+            if not url:
+                print("⚠️ Пустое значение.")
+            else:
+                set_proxy_rotation_urls([url])
+                print("✅ URL сохранен.")
+        elif choice == "3":
+            url = ask_text("Вставьте API URL 9Proxy для добавления: ")
+            if not url:
+                print("⚠️ Пустое значение.")
+            else:
+                urls = add_proxy_rotation_url(url)
+                print(f"✅ Добавлено. Всего URL: {len(urls)}")
+        elif choice == "4":
+            clear_proxy_rotation_urls()
+            print("🧹 Список API URL очищен.")
+        elif choice == "5":
+            print("🧪 Проверяю смену прокси...")
+            ok, message, before_ip, after_ip = test_proxy_rotation_once()
+            print(f"{'✅' if ok else '⚠️'} {message}")
+            print(f"IP до:  {before_ip or 'не удалось определить'}")
+            print(f"IP после: {after_ip or 'не удалось определить'}")
+        elif choice == "6":
+            return
+        else:
+            print("⚠️ Неизвестный пункт меню.")
+
+        input("\nНажмите Enter, чтобы продолжить...")
+
+
 def inbox_check_flow(store: ProfileStore) -> None:
     profile = choose_profile(store)
     if profile is None:
@@ -213,7 +276,8 @@ def show_menu() -> None:
         print("7. ✅ Показать отправленные email (история)")
         print("8. 🧪 Проверка инбокса (TEST1/TEST2/...)")
         print("9. 🔄 Обновление данных")
-        print("10. 🚪 Выход")
+        print("10. 🔐 Настройки прокси (9Proxy)")
+        print("11. 🚪 Выход")
         choice = input("\nВыберите действие: ").strip()
 
         if choice == "1":
@@ -247,6 +311,8 @@ def show_menu() -> None:
             ensure_input_files()
             continue
         elif choice == "10":
+            proxy_settings_flow()
+        elif choice == "11":
             print("👋 Выход.")
             break
         else:

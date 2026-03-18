@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import time
@@ -35,6 +36,7 @@ from config import (
     LOGS_DIR,
     NAME_FILENAME,
     PROXY_ROTATION_ENABLED,
+    PROXY_SETTINGS_FILE,
     PROXY_ROTATION_TIMEOUT_SECONDS,
     PROXY_ROTATION_URLS,
     PROXY_ROTATION_WAIT_SECONDS,
@@ -109,6 +111,11 @@ def ensure_input_files() -> None:
         UNSENT_EMAILS_FILE.write_text("", encoding="utf-8")
     if not INBOX_TEST_COUNTER_FILE.exists():
         INBOX_TEST_COUNTER_FILE.write_text("0", encoding="utf-8")
+    if not PROXY_SETTINGS_FILE.exists():
+        PROXY_SETTINGS_FILE.write_text(
+            json.dumps({"proxy_rotation_urls": PROXY_ROTATION_URLS}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
 
 def _read_non_empty_lines(file_path: Path) -> list[str]:
@@ -244,9 +251,66 @@ def _say(message: str) -> None:
     _write_log(message)
 
 
+def _load_proxy_settings() -> dict[str, Any]:
+    ensure_input_files()
+    try:
+        raw = PROXY_SETTINGS_FILE.read_text(encoding="utf-8").strip()
+        if not raw:
+            return {"proxy_rotation_urls": [url for url in PROXY_ROTATION_URLS if url]}
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            return {"proxy_rotation_urls": [url for url in PROXY_ROTATION_URLS if url]}
+        return payload
+    except Exception:  # noqa: BLE001
+        return {"proxy_rotation_urls": [url for url in PROXY_ROTATION_URLS if url]}
+
+
+def _save_proxy_settings(payload: dict[str, Any]) -> None:
+    ensure_input_files()
+    PROXY_SETTINGS_FILE.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _current_proxy_urls() -> list[str]:
+    payload = _load_proxy_settings()
+    urls = payload.get("proxy_rotation_urls")
+    if not isinstance(urls, list):
+        urls = []
+    cleaned = [str(url).strip() for url in urls if str(url).strip()]
+    if not cleaned:
+        cleaned = [url.strip() for url in PROXY_ROTATION_URLS if url.strip()]
+    return cleaned
+
+
+def get_proxy_rotation_urls() -> list[str]:
+    return _current_proxy_urls()
+
+
+def set_proxy_rotation_urls(urls: list[str]) -> list[str]:
+    cleaned = [url.strip() for url in urls if url and url.strip()]
+    _save_proxy_settings({"proxy_rotation_urls": cleaned})
+    return cleaned
+
+
+def add_proxy_rotation_url(url: str) -> list[str]:
+    current = _current_proxy_urls()
+    normalized = url.strip()
+    if not normalized:
+        return current
+    if normalized not in current:
+        current.append(normalized)
+    return set_proxy_rotation_urls(current)
+
+
+def clear_proxy_rotation_urls() -> None:
+    _save_proxy_settings({"proxy_rotation_urls": []})
+
+
 def _next_proxy_rotation_url() -> str | None:
     global _PROXY_ROTATION_INDEX  # noqa: PLW0603
-    urls = [url.strip() for url in PROXY_ROTATION_URLS if url and url.strip()]
+    urls = _current_proxy_urls()
     if not urls:
         return None
     selected = urls[_PROXY_ROTATION_INDEX % len(urls)]
@@ -279,32 +343,83 @@ def _extract_proxy_port(payload: Any) -> str | None:
     return None
 
 
+def _fetch_public_ip() -> str | None:
+    endpoints = [
+        "https://api.ipify.org?format=json",
+        "https://ifconfig.me/ip",
+        "https://icanhazip.com",
+    ]
+    for endpoint in endpoints:
+        try:
+            response = requests.get(endpoint, timeout=6)
+            response.raise_for_status()
+            text = response.text.strip()
+            if text.startswith("{"):
+                payload = response.json()
+                if isinstance(payload, dict):
+                    ip = payload.get("ip")
+                    if ip:
+                        return str(ip).strip()
+            match = re.search(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", text)
+            if match:
+                return match.group(0)
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+def _trigger_proxy_rotation_once() -> tuple[bool, str]:
+    url = _next_proxy_rotation_url()
+    if not url:
+        return False, "Не задан API URL для смены прокси."
+    response = requests.get(url, timeout=PROXY_ROTATION_TIMEOUT_SECONDS)
+    response.raise_for_status()
+    try:
+        payload: Any = response.json()
+    except ValueError:
+        payload = response.text.strip()
+    port = _extract_proxy_port(payload)
+    if port:
+        return True, f"Прокси обновлен (порт {port})."
+    return True, "Прокси обновлен."
+
+
 def _rotate_proxy_if_needed(batch_size_sent: int) -> None:
     if not PROXY_ROTATION_ENABLED:
         return
     if batch_size_sent < BATCH_SIZE:
         return
-    url = _next_proxy_rotation_url()
-    if not url:
-        return
 
     _say("Меняю прокси через 9Proxy...")
     try:
-        response = requests.get(url, timeout=PROXY_ROTATION_TIMEOUT_SECONDS)
-        response.raise_for_status()
-        try:
-            payload: Any = response.json()
-        except ValueError:
-            payload = response.text.strip()
-        port = _extract_proxy_port(payload)
-        if port:
-            _say(f"Прокси обновлен (порт {port}).")
+        ok, msg = _trigger_proxy_rotation_once()
+        if ok:
+            _say(msg)
         else:
-            _say("Прокси обновлен.")
+            _say("Не удалось сменить прокси.")
         time.sleep(PROXY_ROTATION_WAIT_SECONDS)
     except Exception as exc:  # noqa: BLE001
         _write_log(f"Proxy rotation failed: {exc}")
         _say("Не удалось сменить прокси. Продолжаю текущим.")
+
+
+def test_proxy_rotation_once() -> tuple[bool, str, str | None, str | None]:
+    before_ip = _fetch_public_ip()
+    try:
+        ok, msg = _trigger_proxy_rotation_once()
+        if not ok:
+            return False, msg, before_ip, before_ip
+    except Exception as exc:  # noqa: BLE001
+        return False, f"Ошибка смены прокси: {exc}", before_ip, None
+
+    time.sleep(max(PROXY_ROTATION_WAIT_SECONDS, 0.6))
+    after_ip = _fetch_public_ip()
+    if before_ip and after_ip:
+        changed = before_ip != after_ip
+        if changed:
+            return True, "Прокси сменился успешно.", before_ip, after_ip
+        return False, "IP не изменился после смены.", before_ip, after_ip
+    return True, "Смена выполнена, но IP проверить не удалось.", before_ip, after_ip
 
 
 def _get_or_start_ads_session(profile: Profile, ads_client: AdsApiClient) -> AdsBrowserSession:
