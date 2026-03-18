@@ -23,6 +23,16 @@ DEFAULT_PCLOUD_URL = "https://my.pcloud.com/"
 BATCH_SIZE = 20
 BATCH_DELAY_SECONDS = 0.6
 
+# 9Proxy rotation (same running script, no manual restart)
+# If you use a single 9Proxy API URL, keep one item in the list.
+# If you have multiple URLs/keys, put all of them in this list (round-robin).
+PROXY_ROTATION_ENABLED = True
+PROXY_ROTATION_URLS = [
+    "http://127.0.0.1:10101/api/proxy?t=2&num=1&country=GB",
+]
+PROXY_ROTATION_TIMEOUT_SECONDS = 12
+PROXY_ROTATION_WAIT_SECONDS = 0.8
+
 # Files and directories
 EDIT_DIR_CANDIDATES = [BASE_DIR / "edit", BASE_DIR / "EDIT"]
 EMAIL_DIR_CANDIDATES = [BASE_DIR / "email", BASE_DIR / "EMAIL"]

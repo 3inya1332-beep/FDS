@@ -10,6 +10,8 @@ from typing import Any, Callable, Iterable, TypeVar
 # Hide noisy node deprecation warnings from Playwright driver.
 os.environ.setdefault("NODE_NO_WARNINGS", "1")
 
+import requests
+
 try:
     from playwright.sync_api import Locator, Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 except ModuleNotFoundError:  # pragma: no cover - handled in runtime check
@@ -32,6 +34,10 @@ from config import (
     INBOX_TEST_COUNTER_FILE,
     LOGS_DIR,
     NAME_FILENAME,
+    PROXY_ROTATION_ENABLED,
+    PROXY_ROTATION_TIMEOUT_SECONDS,
+    PROXY_ROTATION_URLS,
+    PROXY_ROTATION_WAIT_SECONDS,
     SENT_EMAILS_FILE,
     TEXT_FILENAME,
     UNSENT_EMAILS_FILE,
@@ -68,6 +74,7 @@ UI_SHORT_TIMEOUT = 4_200
 UI_MEDIUM_TIMEOUT = 6_500
 UI_STEP_DELAY_MS = 90
 _ACTIVE_ADS_SESSIONS: dict[str, AdsBrowserSession] = {}
+_PROXY_ROTATION_INDEX = 0
 
 
 def _resolve_or_create_dir(candidates: list[Path]) -> Path:
@@ -235,6 +242,69 @@ def _chunked(items: Iterable[str], size: int) -> list[list[str]]:
 def _say(message: str) -> None:
     print(f"✨ {message}", flush=True)
     _write_log(message)
+
+
+def _next_proxy_rotation_url() -> str | None:
+    global _PROXY_ROTATION_INDEX  # noqa: PLW0603
+    urls = [url.strip() for url in PROXY_ROTATION_URLS if url and url.strip()]
+    if not urls:
+        return None
+    selected = urls[_PROXY_ROTATION_INDEX % len(urls)]
+    _PROXY_ROTATION_INDEX = (_PROXY_ROTATION_INDEX + 1) % len(urls)
+    return selected
+
+
+def _extract_proxy_port(payload: Any) -> str | None:
+    if isinstance(payload, dict):
+        for key in ("port", "proxy_port", "proxyPort", "socks5_port", "http_port"):
+            value = payload.get(key)
+            if value is not None and str(value).strip():
+                return str(value).strip()
+        for key in ("data", "result", "proxy"):
+            nested = payload.get(key)
+            port = _extract_proxy_port(nested)
+            if port:
+                return port
+        return None
+    if isinstance(payload, list):
+        for item in payload:
+            port = _extract_proxy_port(item)
+            if port:
+                return port
+        return None
+    if isinstance(payload, str):
+        match = re.search(r":(\d{2,5})(?::|$)", payload)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _rotate_proxy_if_needed(batch_size_sent: int) -> None:
+    if not PROXY_ROTATION_ENABLED:
+        return
+    if batch_size_sent < BATCH_SIZE:
+        return
+    url = _next_proxy_rotation_url()
+    if not url:
+        return
+
+    _say("Меняю прокси через 9Proxy...")
+    try:
+        response = requests.get(url, timeout=PROXY_ROTATION_TIMEOUT_SECONDS)
+        response.raise_for_status()
+        try:
+            payload: Any = response.json()
+        except ValueError:
+            payload = response.text.strip()
+        port = _extract_proxy_port(payload)
+        if port:
+            _say(f"Прокси обновлен (порт {port}).")
+        else:
+            _say("Прокси обновлен.")
+        time.sleep(PROXY_ROTATION_WAIT_SECONDS)
+    except Exception as exc:  # noqa: BLE001
+        _write_log(f"Proxy rotation failed: {exc}")
+        _say("Не удалось сменить прокси. Продолжаю текущим.")
 
 
 def _get_or_start_ads_session(profile: Profile, ads_client: AdsApiClient) -> AdsBrowserSession:
@@ -733,6 +803,13 @@ def send_invites(profile: Profile) -> RunStats:
                 sent_emails += len(batch)
                 _append_sent_emails(batch)
                 _say(f"Пакет {index}: успешно.")
+                if index < len(batches):
+                    _rotate_proxy_if_needed(len(batch))
+                    try:
+                        ui.page.reload(wait_until="domcontentloaded", timeout=12_000)
+                        ui.page.wait_for_timeout(120)
+                    except Exception:  # noqa: BLE001
+                        pass
             except Exception as batch_exc:  # noqa: BLE001
                 failed_batches += 1
                 _write_log(f"Batch failed ({len(batch)} emails): {batch_exc}")
