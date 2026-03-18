@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
 import sqlite3
+import sys
+import time
 from typing import Iterable
 
 from ads_api import AdsApiError
@@ -12,10 +15,18 @@ from pcloud_automation import (
     get_sent_emails,
     get_unsent_emails,
     inbox_check,
+    refresh_email_data,
     send_invites,
     setup_folder,
 )
 from profile_store import Profile, ProfileStore
+
+
+def clear_console() -> None:
+    if os.name == "nt":
+        os.system("cls")
+    else:
+        print("\033[2J\033[H", end="")
 
 
 def print_header() -> None:
@@ -67,6 +78,12 @@ def print_email_list(title: str, emails: list[str], preview_limit: int = 25) -> 
         print(f"  • {email}")
     if len(emails) > preview_limit:
         print(f"  ... и еще {len(emails) - preview_limit}")
+
+
+def restart_script() -> None:
+    print("\n🔄 Обновляю данные и перезапускаю скрипт...")
+    time.sleep(0.7)
+    os.execv(sys.executable, [sys.executable, *sys.argv])
 
 
 def add_profile_flow(store: ProfileStore) -> None:
@@ -163,6 +180,16 @@ def show_sent_flow() -> None:
     print("Файл со списком: email_history/sent_emails.txt")
 
 
+def refresh_data_flow() -> None:
+    print("🔄 Обновляю данные из папки email...")
+    try:
+        sent_count, unsent_count = refresh_email_data()
+        print(f"✅ Готово: отправленных = {sent_count}, неотправленных = {unsent_count}")
+        restart_script()
+    except PcloudAutomationError as exc:
+        print(f"\n❌ Не удалось обновить данные: {exc}")
+
+
 def inbox_check_flow(store: ProfileStore) -> None:
     profile = choose_profile(store)
     if profile is None:
@@ -188,6 +215,7 @@ def show_menu() -> None:
     ensure_input_files()
 
     while True:
+        clear_console()
         print_header()
         print("1. ➕ Добавить профиль ADS Browser")
         print("2. 👀 Показать профили")
@@ -197,26 +225,38 @@ def show_menu() -> None:
         print("6. 📭 Показать неотправленные email")
         print("7. ✅ Показать отправленные email (история)")
         print("8. 🧪 Проверка инбокса (TEST1/TEST2/...)")
-        print("9. 🚪 Выход")
+        print("9. 🔄 Обновление данных (перезапуск)")
+        print("10. 🚪 Выход")
         choice = input("\nВыберите действие: ").strip()
 
         if choice == "1":
+            clear_console()
             add_profile_flow(store)
         elif choice == "2":
+            clear_console()
             print_profiles(store.list_profiles())
         elif choice == "3":
+            clear_console()
             delete_profile_flow(store)
         elif choice == "4":
+            clear_console()
             setup_flow(store)
         elif choice == "5":
+            clear_console()
             send_flow(store)
         elif choice == "6":
+            clear_console()
             show_unsent_flow()
         elif choice == "7":
+            clear_console()
             show_sent_flow()
         elif choice == "8":
+            clear_console()
             inbox_check_flow(store)
         elif choice == "9":
+            clear_console()
+            refresh_data_flow()
+        elif choice == "10":
             print("👋 Выход.")
             break
         else:

@@ -64,9 +64,9 @@ class InboxCheckStats:
 
 
 T = TypeVar("T")
-UI_SHORT_TIMEOUT = 5_500
-UI_MEDIUM_TIMEOUT = 8_000
-UI_STEP_DELAY_MS = 350
+UI_SHORT_TIMEOUT = 4_200
+UI_MEDIUM_TIMEOUT = 6_500
+UI_STEP_DELAY_MS = 180
 
 
 def _resolve_or_create_dir(candidates: list[Path]) -> Path:
@@ -173,12 +173,24 @@ def _load_all_unique_emails() -> list[str]:
     return unique_emails
 
 
+def load_message_text() -> str:
+    edit_dir = _resolve_or_create_dir(EDIT_DIR_CANDIDATES)
+    return (edit_dir / TEXT_FILENAME).read_text(encoding="utf-8").strip()
+
+
 def get_unsent_emails() -> list[str]:
     all_emails = _load_all_unique_emails()
     sent = _load_sent_emails_set()
     unsent = [email for email in all_emails if _normalize_email(email) not in sent]
     _save_unsent_emails(unsent)
     return unsent
+
+
+def refresh_email_data() -> tuple[int, int]:
+    ensure_input_files()
+    unsent = get_unsent_emails()
+    sent = get_sent_emails()
+    return len(sent), len(unsent)
 
 
 def load_job_data(exclude_sent: bool = False) -> tuple[str, str, list[str]]:
@@ -188,7 +200,7 @@ def load_job_data(exclude_sent: bool = False) -> tuple[str, str, list[str]]:
     if not folder_name:
         raise PcloudAutomationError(f"Файл {NAME_FILENAME} пуст.")
 
-    message_text = (edit_dir / TEXT_FILENAME).read_text(encoding="utf-8").strip()
+    message_text = load_message_text()
     unique_emails = _load_all_unique_emails()
 
     if exclude_sent:
@@ -250,10 +262,10 @@ class PcloudUi:
             pass
 
     def open_home(self, url: str) -> None:
-        self.page.goto(url, wait_until="domcontentloaded", timeout=45_000)
+        self.page.goto(url, wait_until="domcontentloaded", timeout=30_000)
         # pCloud keeps background requests, so networkidle can hang forever.
-        self.page.wait_for_load_state("load", timeout=UI_MEDIUM_TIMEOUT)
-        self.page.wait_for_selector("body", timeout=UI_SHORT_TIMEOUT)
+        self.page.wait_for_load_state("load", timeout=5_500)
+        self.page.wait_for_selector("body", timeout=3_500)
         self.page.wait_for_timeout(UI_STEP_DELAY_MS)
 
     def _is_login_page(self) -> bool:
@@ -265,21 +277,16 @@ class PcloudUi:
         return has_password and has_email
 
     def _visible_dialog(self) -> Locator:
-        selectors = [
-            'div[role="dialog"]:visible',
-            '.modal:visible',
-            '.visitor:visible',
-            "[class*='dialog']:visible",
-            "[class*='modal']:visible",
-            ".popup:visible",
-        ]
-        for selector in selectors:
-            locator = self.page.locator(selector).last
-            try:
-                locator.wait_for(state="visible", timeout=2_500)
-                return locator
-            except PlaywrightTimeoutError:
-                continue
+        selector = (
+            'div[role="dialog"]:visible, .modal:visible, .visitor:visible, '
+            "[class*='dialog']:visible, [class*='modal']:visible, .popup:visible"
+        )
+        locator = self.page.locator(selector).last
+        try:
+            locator.wait_for(state="visible", timeout=2_000)
+            return locator
+        except PlaywrightTimeoutError:
+            pass
         raise PcloudAutomationError(
             "Окно не открылось. Проверьте, что пункт Invite to Folder доступен."
         )
@@ -291,10 +298,9 @@ class PcloudUi:
         ]
         for tab in tab_candidates:
             try:
-                if tab.count() > 0:
-                    tab.click(timeout=1_200)
-                    self.page.wait_for_timeout(120)
-                    return
+                tab.click(timeout=500)
+                self.page.wait_for_timeout(60)
+                return
             except Exception:  # noqa: BLE001
                 continue
 
@@ -381,22 +387,14 @@ class PcloudUi:
             # Last resort: top-right click area where Add button is in desktop pCloud UI.
             view = self.page.viewport_size or {"width": 1280, "height": 720}
             self.page.mouse.click(view["width"] - 75, 48)
-            self.page.wait_for_timeout(500)
+            self.page.wait_for_timeout(200)
 
-        folder_menu_candidates = [
-            self.page.get_by_text(re.compile(r"^(New Folder|Новая папка)$", re.I)).first,
-            self.page.get_by_text(re.compile(r"^(Folder|Папка)$", re.I)).first,
-        ]
-        folder_menu_item: Locator | None = None
-        for candidate in folder_menu_candidates:
-            try:
-                candidate.wait_for(state="visible", timeout=1_500)
-                folder_menu_item = candidate
-                break
-            except PlaywrightTimeoutError:
-                continue
-
-        if folder_menu_item is None:
+        folder_menu_item = self.page.get_by_text(
+            re.compile(r"^(New Folder|Новая папка|Folder|Папка)$", re.I)
+        ).first
+        try:
+            folder_menu_item.wait_for(state="visible", timeout=1_200)
+        except PlaywrightTimeoutError:
             raise PcloudAutomationError(
                 "После клика Add не найден пункт New Folder/Folder в выпадающем меню."
             )
@@ -405,8 +403,10 @@ class PcloudUi:
         # Flow A: modal/visitor dialog with name input and create button.
         try:
             dialog = self._visible_dialog()
-            name_input = dialog.locator("input[type='text'], input").first
-            name_input.wait_for(state="visible", timeout=2_500)
+            name_input = dialog.locator(
+                "input[name='name']:visible, input[type='text']:visible, input:visible"
+            ).first
+            name_input.wait_for(state="visible", timeout=1_400)
             name_input.fill(folder_name)
 
             create_button = dialog.get_by_role(
@@ -414,7 +414,7 @@ class PcloudUi:
                 name=re.compile(r"Create|Save|OK|Done|Готово|Создать", re.I),
             ).first
             try:
-                create_button.wait_for(state="visible", timeout=1_500)
+                create_button.wait_for(state="visible", timeout=900)
                 create_button.click()
             except PlaywrightTimeoutError:
                 name_input.press("Enter")
@@ -452,23 +452,25 @@ class PcloudUi:
 
     def _open_invite_dialog(self, folder_name: str) -> None:
         self._open_folder_context_menu(folder_name)
-        invite_candidates = [
-            self.page.get_by_text(re.compile(r"^Invite to Folder$", re.I)).first,
-            self.page.get_by_text(re.compile(r"^Invite to folder$", re.I)).first,
-            self.page.get_by_role("menuitem", name=re.compile(r"Invite to Folder", re.I)).first,
-            self.page.get_by_text(re.compile(r"^Invite", re.I)).first,
-        ]
-        for candidate in invite_candidates:
-            try:
-                candidate.wait_for(state="visible", timeout=1_000)
-                candidate.click()
-                self.page.wait_for_timeout(120)
-                self._visible_dialog()
-                return
-            except Exception:  # noqa: BLE001
-                continue
+        invite_item = self.page.get_by_text(re.compile(r"^Invite to Folder$", re.I)).first
+        try:
+            invite_item.wait_for(state="visible", timeout=1_100)
+            invite_item.click()
+            self.page.wait_for_timeout(80)
+            self._visible_dialog()
+            return
+        except Exception:  # noqa: BLE001
+            pass
 
-        raise PcloudAutomationError("Не удалось нажать пункт 'Invite to Folder' в меню папки.")
+        fallback_item = self.page.get_by_text(re.compile(r"^Invite", re.I)).first
+        try:
+            fallback_item.wait_for(state="visible", timeout=800)
+            fallback_item.click()
+            self.page.wait_for_timeout(80)
+            self._visible_dialog()
+            return
+        except Exception as exc:  # noqa: BLE001
+            raise PcloudAutomationError("Не удалось нажать пункт 'Invite to Folder' в меню папки.") from exc
 
     def invite_batch(self, folder_name: str, emails: list[str], message_text: str) -> None:
         self._open_invite_dialog(folder_name)
@@ -480,14 +482,14 @@ class PcloudUi:
             for _ in range(2):
                 try:
                     email_input = self._get_visible_email_input(dialog)
-                    email_input.click(timeout=900)
-                    email_input.fill(email, timeout=900)
+                    email_input.click(timeout=700)
+                    email_input.fill(email, timeout=700)
                     email_input.press("Enter")
-                    self.page.wait_for_timeout(45)
+                    self.page.wait_for_timeout(30)
                     sent = True
                     break
                 except Exception:  # noqa: BLE001
-                    self.page.wait_for_timeout(90)
+                    self.page.wait_for_timeout(60)
             if not sent:
                 raise PcloudAutomationError(f"Не удалось добавить email: {email}")
 
@@ -499,7 +501,7 @@ class PcloudUi:
             for message_area in message_candidates:
                 try:
                     if message_area.count() > 0:
-                        message_area.fill(message_text, timeout=1_500)
+                        message_area.fill(message_text, timeout=900)
                         break
                 except Exception:  # noqa: BLE001
                     continue
@@ -512,7 +514,7 @@ class PcloudUi:
         share_clicked = False
         for button in share_candidates:
             try:
-                button.wait_for(state="visible", timeout=1_200)
+                button.wait_for(state="visible", timeout=800)
                 button.click()
                 share_clicked = True
                 break
@@ -526,7 +528,7 @@ class PcloudUi:
         except PlaywrightTimeoutError:
             # Some pCloud states keep the dialog open with a success toast.
             self.page.keyboard.press("Escape")
-            self.page.wait_for_timeout(250)
+            self.page.wait_for_timeout(120)
 
 
 def _run_in_ads_browser(profile: Profile, worker: Callable[[PcloudUi], T]) -> T:
@@ -653,11 +655,12 @@ def inbox_check(profile: Profile, email: str) -> InboxCheckStats:
         raise PcloudAutomationError("Введите корректный email для проверки инбокса.")
 
     folder_name = _next_inbox_test_folder_name()
+    message_text = load_message_text()
     _say(f'Проверка инбокса: создаю папку "{folder_name}" и отправляю инвайт на {target_email}')
 
     def worker(ui: PcloudUi) -> InboxCheckStats:
         ui.create_folder(folder_name)
-        ui.invite_batch(folder_name, [target_email], f"Inbox check: {folder_name}")
+        ui.invite_batch(folder_name, [target_email], message_text)
         return InboxCheckStats(folder_name=folder_name, email=target_email, invite_sent=True)
 
     return _run_in_ads_browser(profile, worker)
