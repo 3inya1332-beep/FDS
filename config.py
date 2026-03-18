@@ -8,6 +8,7 @@ API_KEY = "PASTE_YOUR_ADS_API_KEY"
 ADS_TIMEOUT_SECONDS = 60
 ADS_HEADLESS = False
 ADS_OPEN_TABS = 1
+ADS_REQUEST_PAUSE_SECONDS = 0.8
 
 # pCloud automation defaults
 DEFAULT_PCLOUD_URL = "https://my.pcloud.com/"

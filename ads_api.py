@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
 
 import requests
 
-from config import ADS_TIMEOUT_SECONDS, API_KEY, LOCAL_API_BASE
+from config import ADS_REQUEST_PAUSE_SECONDS, ADS_TIMEOUT_SECONDS, API_KEY, LOCAL_API_BASE
 
 
 class AdsApiError(RuntimeError):
@@ -30,21 +31,31 @@ class AdsApiClient:
         self.api_key = api_key.strip()
         self.timeout_seconds = timeout_seconds
 
+    def _api_key_ready(self) -> bool:
+        return bool(self.api_key and self.api_key != "PASTE_YOUR_ADS_API_KEY")
+
     def _headers(self) -> dict[str, str]:
         headers = {"Accept": "application/json"}
-        if self.api_key and self.api_key != "PASTE_YOUR_ADS_API_KEY":
+        if self._api_key_ready():
             # Different ADS API builds may use one of these headers.
             headers["Authorization"] = self.api_key
             headers["X-API-KEY"] = self.api_key
         return headers
 
-    def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+    def _request(self, method: str, path: str, params: dict[str, Any] | None = None, **kwargs: Any) -> dict[str, Any]:
+        final_params = dict(params or {})
+        # Some ADS API builds expect api-key in query params.
+        if self._api_key_ready():
+            final_params.setdefault("api_key", self.api_key)
+            final_params.setdefault("api-key", self.api_key)
+
         url = f"{self.base_url}{path}"
         response = requests.request(
             method=method.upper(),
             url=url,
             timeout=self.timeout_seconds,
             headers=self._headers(),
+            params=final_params,
             **kwargs,
         )
         response.raise_for_status()
@@ -52,6 +63,13 @@ class AdsApiClient:
         if isinstance(payload, dict):
             return payload
         raise AdsApiError(f"Unexpected ADS API response: {payload!r}")
+
+    @staticmethod
+    def _msg(payload: dict[str, Any]) -> str:
+        msg = payload.get("msg")
+        if isinstance(msg, str):
+            return msg
+        return str(payload)
 
     @staticmethod
     def _extract_cdp_url(data: dict[str, Any]) -> str | None:
@@ -128,15 +146,26 @@ class AdsApiClient:
             try:
                 response_payload = self._request(method, path, **kwargs)
                 if not self._is_success(response_payload):
+                    msg = self._msg(response_payload)
+                    lowered = msg.lower()
                     errors.append(str(response_payload))
+                    if "require api-key" in lowered or "require api key" in lowered:
+                        raise AdsApiError(
+                            "ADS API требует api-key. Укажите ключ в config.py -> API_KEY"
+                        )
+                    if "too many request" in lowered:
+                        time.sleep(ADS_REQUEST_PAUSE_SECONDS)
                     continue
                 data = self._data_from_payload(response_payload)
                 cdp_url = self._extract_cdp_url(data)
                 if cdp_url:
                     return AdsBrowserSession(profile_id=profile_id, cdp_url=cdp_url)
                 errors.append(f"CDP endpoint not found in payload: {response_payload}")
+            except AdsApiError:
+                raise
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"{method} {path} failed: {exc}")
+            time.sleep(ADS_REQUEST_PAUSE_SECONDS)
 
         raise AdsApiError("Unable to start ADS browser profile. " + " | ".join(errors))
 
