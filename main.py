@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import os
 import sqlite3
-import sys
-import time
 from typing import Iterable
 
 from ads_api import AdsApiError
@@ -23,10 +20,7 @@ from profile_store import Profile, ProfileStore
 
 
 def clear_console() -> None:
-    if os.name == "nt":
-        os.system("cls")
-    else:
-        print("\033[2J\033[H", end="")
+    print("\033[2J\033[H", end="", flush=True)
 
 
 def print_header() -> None:
@@ -78,12 +72,6 @@ def print_email_list(title: str, emails: list[str], preview_limit: int = 25) -> 
         print(f"  • {email}")
     if len(emails) > preview_limit:
         print(f"  ... и еще {len(emails) - preview_limit}")
-
-
-def restart_script() -> None:
-    print("\n🔄 Обновляю данные и перезапускаю скрипт...")
-    time.sleep(0.7)
-    os.execv(sys.executable, [sys.executable, *sys.argv])
 
 
 def add_profile_flow(store: ProfileStore) -> None:
@@ -185,7 +173,6 @@ def refresh_data_flow() -> None:
     try:
         sent_count, unsent_count = refresh_email_data()
         print(f"✅ Готово: отправленных = {sent_count}, неотправленных = {unsent_count}")
-        restart_script()
     except PcloudAutomationError as exc:
         print(f"\n❌ Не удалось обновить данные: {exc}")
 
@@ -225,7 +212,7 @@ def show_menu() -> None:
         print("6. 📭 Показать неотправленные email")
         print("7. ✅ Показать отправленные email (история)")
         print("8. 🧪 Проверка инбокса (TEST1/TEST2/...)")
-        print("9. 🔄 Обновление данных (перезапуск)")
+        print("9. 🔄 Обновление данных")
         print("10. 🚪 Выход")
         choice = input("\nВыберите действие: ").strip()
 
@@ -256,6 +243,9 @@ def show_menu() -> None:
         elif choice == "9":
             clear_console()
             refresh_data_flow()
+            store = ProfileStore()
+            ensure_input_files()
+            continue
         elif choice == "10":
             print("👋 Выход.")
             break

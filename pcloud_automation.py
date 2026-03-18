@@ -66,7 +66,7 @@ class InboxCheckStats:
 T = TypeVar("T")
 UI_SHORT_TIMEOUT = 4_200
 UI_MEDIUM_TIMEOUT = 6_500
-UI_STEP_DELAY_MS = 180
+UI_STEP_DELAY_MS = 90
 
 
 def _resolve_or_create_dir(candidates: list[Path]) -> Path:
@@ -447,7 +447,7 @@ class PcloudUi:
         folder_label = self._ensure_folder_visible(folder_name, timeout=UI_MEDIUM_TIMEOUT)
         folder_label.scroll_into_view_if_needed()
         folder_label.click(button="right")
-        self.page.wait_for_timeout(180)
+        self.page.wait_for_timeout(70)
         return folder_label
 
     def _open_invite_dialog(self, folder_name: str) -> None:
@@ -456,7 +456,7 @@ class PcloudUi:
         try:
             invite_item.wait_for(state="visible", timeout=1_100)
             invite_item.click()
-            self.page.wait_for_timeout(80)
+            self.page.wait_for_timeout(35)
             self._visible_dialog()
             return
         except Exception:  # noqa: BLE001
@@ -466,7 +466,7 @@ class PcloudUi:
         try:
             fallback_item.wait_for(state="visible", timeout=800)
             fallback_item.click()
-            self.page.wait_for_timeout(80)
+            self.page.wait_for_timeout(35)
             self._visible_dialog()
             return
         except Exception as exc:  # noqa: BLE001
