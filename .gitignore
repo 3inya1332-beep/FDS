@@ -1,5 +1,6 @@
 __pycache__/
 *.pyc
 logs/
+email_history/
 profiles.db
 .idea/

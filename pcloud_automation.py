@@ -25,12 +25,16 @@ from config import (
     BATCH_DELAY_SECONDS,
     BATCH_SIZE,
     DEFAULT_PCLOUD_URL,
+    EMAIL_HISTORY_DIR,
     EDIT_DIR_CANDIDATES,
     EMAIL_DIR_CANDIDATES,
     EMAIL_FILENAME,
+    INBOX_TEST_COUNTER_FILE,
     LOGS_DIR,
     NAME_FILENAME,
+    SENT_EMAILS_FILE,
     TEXT_FILENAME,
+    UNSENT_EMAILS_FILE,
 )
 from profile_store import Profile
 
@@ -52,10 +56,17 @@ class SetupStats:
     folder_created: bool
 
 
+@dataclass
+class InboxCheckStats:
+    folder_name: str
+    email: str
+    invite_sent: bool
+
+
 T = TypeVar("T")
-UI_SHORT_TIMEOUT = 8_000
-UI_MEDIUM_TIMEOUT = 12_000
-UI_STEP_DELAY_MS = 900
+UI_SHORT_TIMEOUT = 5_500
+UI_MEDIUM_TIMEOUT = 8_000
+UI_STEP_DELAY_MS = 350
 
 
 def _resolve_or_create_dir(candidates: list[Path]) -> Path:
@@ -83,6 +94,13 @@ def ensure_input_files() -> None:
         email_file.write_text("example1@mail.com\nexample2@mail.com\n", encoding="utf-8")
 
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    EMAIL_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+    if not SENT_EMAILS_FILE.exists():
+        SENT_EMAILS_FILE.write_text("", encoding="utf-8")
+    if not UNSENT_EMAILS_FILE.exists():
+        UNSENT_EMAILS_FILE.write_text("", encoding="utf-8")
+    if not INBOX_TEST_COUNTER_FILE.exists():
+        INBOX_TEST_COUNTER_FILE.write_text("0", encoding="utf-8")
 
 
 def _read_non_empty_lines(file_path: Path) -> list[str]:
@@ -90,6 +108,42 @@ def _read_non_empty_lines(file_path: Path) -> list[str]:
         raise PcloudAutomationError(f"Файл не найден: {file_path}")
     lines = [line.strip() for line in file_path.read_text(encoding="utf-8").splitlines()]
     return [line for line in lines if line]
+
+
+def _normalize_email(email: str) -> str:
+    return email.strip().lower()
+
+
+def _load_sent_emails_set() -> set[str]:
+    ensure_input_files()
+    return {_normalize_email(line) for line in _read_non_empty_lines(SENT_EMAILS_FILE)}
+
+
+def get_sent_emails() -> list[str]:
+    return sorted(_load_sent_emails_set())
+
+
+def _append_sent_emails(emails: list[str]) -> None:
+    if not emails:
+        return
+    existing = _load_sent_emails_set()
+    new_items: list[str] = []
+    for email in emails:
+        normalized = _normalize_email(email)
+        if normalized and normalized not in existing:
+            existing.add(normalized)
+            new_items.append(normalized)
+    if new_items:
+        with SENT_EMAILS_FILE.open("a", encoding="utf-8") as file:
+            for email in new_items:
+                file.write(email + "\n")
+
+
+def _save_unsent_emails(emails: list[str]) -> None:
+    ensure_input_files()
+    with UNSENT_EMAILS_FILE.open("w", encoding="utf-8") as file:
+        for email in emails:
+            file.write(_normalize_email(email) + "\n")
 
 
 def _find_email_file(email_dir: Path) -> Path:
@@ -104,28 +158,49 @@ def _find_email_file(email_dir: Path) -> Path:
     )
 
 
-def load_job_data() -> tuple[str, str, list[str]]:
-    edit_dir = _resolve_or_create_dir(EDIT_DIR_CANDIDATES)
+def _load_all_unique_emails() -> list[str]:
     email_dir = _resolve_or_create_dir(EMAIL_DIR_CANDIDATES)
+    email_file = _find_email_file(email_dir)
+    raw_emails = _read_non_empty_lines(email_file)
+
+    unique_emails: list[str] = []
+    seen: set[str] = set()
+    for email in raw_emails:
+        lowered = _normalize_email(email)
+        if lowered and lowered not in seen:
+            unique_emails.append(lowered)
+            seen.add(lowered)
+    return unique_emails
+
+
+def get_unsent_emails() -> list[str]:
+    all_emails = _load_all_unique_emails()
+    sent = _load_sent_emails_set()
+    unsent = [email for email in all_emails if _normalize_email(email) not in sent]
+    _save_unsent_emails(unsent)
+    return unsent
+
+
+def load_job_data(exclude_sent: bool = False) -> tuple[str, str, list[str]]:
+    edit_dir = _resolve_or_create_dir(EDIT_DIR_CANDIDATES)
 
     folder_name = (edit_dir / NAME_FILENAME).read_text(encoding="utf-8").strip()
     if not folder_name:
         raise PcloudAutomationError(f"Файл {NAME_FILENAME} пуст.")
 
     message_text = (edit_dir / TEXT_FILENAME).read_text(encoding="utf-8").strip()
-    email_file = _find_email_file(email_dir)
-    raw_emails = _read_non_empty_lines(email_file)
+    unique_emails = _load_all_unique_emails()
 
-    # Keep order but remove accidental duplicates.
-    unique_emails: list[str] = []
-    seen: set[str] = set()
-    for email in raw_emails:
-        lowered = email.lower()
-        if lowered not in seen:
-            unique_emails.append(email)
-            seen.add(lowered)
+    if exclude_sent:
+        sent = _load_sent_emails_set()
+        unique_emails = [email for email in unique_emails if _normalize_email(email) not in sent]
+        _save_unsent_emails(unique_emails)
 
     if not unique_emails:
+        if exclude_sent:
+            raise PcloudAutomationError(
+                "Новых email для отправки нет. Все адреса уже были отправлены раньше."
+            )
         raise PcloudAutomationError("Список email пуст.")
 
     return folder_name, message_text, unique_emails
@@ -145,7 +220,7 @@ def _chunked(items: Iterable[str], size: int) -> list[list[str]]:
 
 
 def _say(message: str) -> None:
-    print(f"• {message}")
+    print(f"✨ {message}", flush=True)
     _write_log(message)
 
 
@@ -233,7 +308,7 @@ class PcloudUi:
         ]
         for candidate in candidates:
             try:
-                candidate.wait_for(state="visible", timeout=1_800)
+                candidate.wait_for(state="visible", timeout=1_000)
                 return candidate
             except PlaywrightTimeoutError:
                 continue
@@ -372,7 +447,7 @@ class PcloudUi:
         folder_label = self._ensure_folder_visible(folder_name, timeout=UI_MEDIUM_TIMEOUT)
         folder_label.scroll_into_view_if_needed()
         folder_label.click(button="right")
-        self.page.wait_for_timeout(350)
+        self.page.wait_for_timeout(180)
         return folder_label
 
     def _open_invite_dialog(self, folder_name: str) -> None:
@@ -385,9 +460,9 @@ class PcloudUi:
         ]
         for candidate in invite_candidates:
             try:
-                candidate.wait_for(state="visible", timeout=1_500)
+                candidate.wait_for(state="visible", timeout=1_000)
                 candidate.click()
-                self.page.wait_for_timeout(300)
+                self.page.wait_for_timeout(120)
                 self._visible_dialog()
                 return
             except Exception:  # noqa: BLE001
@@ -402,17 +477,17 @@ class PcloudUi:
 
         for email in emails:
             sent = False
-            for _ in range(3):
+            for _ in range(2):
                 try:
                     email_input = self._get_visible_email_input(dialog)
-                    email_input.click(timeout=1_200)
-                    email_input.fill(email, timeout=1_200)
+                    email_input.click(timeout=900)
+                    email_input.fill(email, timeout=900)
                     email_input.press("Enter")
-                    self.page.wait_for_timeout(120)
+                    self.page.wait_for_timeout(45)
                     sent = True
                     break
                 except Exception:  # noqa: BLE001
-                    self.page.wait_for_timeout(220)
+                    self.page.wait_for_timeout(90)
             if not sent:
                 raise PcloudAutomationError(f"Не удалось добавить email: {email}")
 
@@ -508,7 +583,7 @@ def _run_in_ads_browser(profile: Profile, worker: Callable[[PcloudUi], T]) -> T:
 
 def setup_folder(profile: Profile) -> SetupStats:
     ensure_input_files()
-    folder_name, _, _ = load_job_data()
+    folder_name, _, _ = load_job_data(exclude_sent=False)
     _say(f'Настройка: папка "{folder_name}"')
 
     def worker(ui: PcloudUi) -> SetupStats:
@@ -526,7 +601,7 @@ def setup_folder(profile: Profile) -> SetupStats:
 
 def send_invites(profile: Profile) -> RunStats:
     ensure_input_files()
-    folder_name, message_text, emails = load_job_data()
+    folder_name, message_text, emails = load_job_data(exclude_sent=True)
     sent_emails = 0
     failed_batches = 0
     batches = _chunked(emails, BATCH_SIZE)
@@ -540,6 +615,7 @@ def send_invites(profile: Profile) -> RunStats:
                 _say(f"Пакет {index}/{len(batches)}: отправляю {len(batch)} email...")
                 ui.invite_batch(folder_name, batch, message_text)
                 sent_emails += len(batch)
+                _append_sent_emails(batch)
                 _say(f"Пакет {index}: успешно.")
             except Exception as batch_exc:  # noqa: BLE001
                 failed_batches += 1
@@ -550,11 +626,41 @@ def send_invites(profile: Profile) -> RunStats:
         return RunStats(total_emails=len(emails), sent_emails=sent_emails, failed_batches=failed_batches)
 
     stats = _run_in_ads_browser(profile, worker)
+    _save_unsent_emails(get_unsent_emails())
     _say(
         f"Отправка завершена: {stats.sent_emails}/{stats.total_emails}, "
         f"ошибочных пакетов: {stats.failed_batches}"
     )
     return stats
+
+
+def _next_inbox_test_folder_name() -> str:
+    ensure_input_files()
+    raw_value = INBOX_TEST_COUNTER_FILE.read_text(encoding="utf-8").strip()
+    try:
+        current = int(raw_value)
+    except ValueError:
+        current = 0
+    current += 1
+    INBOX_TEST_COUNTER_FILE.write_text(str(current), encoding="utf-8")
+    return f"TEST{current}"
+
+
+def inbox_check(profile: Profile, email: str) -> InboxCheckStats:
+    ensure_input_files()
+    target_email = _normalize_email(email)
+    if not target_email or "@" not in target_email:
+        raise PcloudAutomationError("Введите корректный email для проверки инбокса.")
+
+    folder_name = _next_inbox_test_folder_name()
+    _say(f'Проверка инбокса: создаю папку "{folder_name}" и отправляю инвайт на {target_email}')
+
+    def worker(ui: PcloudUi) -> InboxCheckStats:
+        ui.create_folder(folder_name)
+        ui.invite_batch(folder_name, [target_email], f"Inbox check: {folder_name}")
+        return InboxCheckStats(folder_name=folder_name, email=target_email, invite_sent=True)
+
+    return _run_in_ads_browser(profile, worker)
 
 
 def run_job(profile: Profile) -> RunStats:

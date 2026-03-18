@@ -32,3 +32,7 @@ EMAIL_FILENAME = "emails.txt"
 
 PROFILE_DB_PATH = BASE_DIR / "profiles.db"
 LOGS_DIR = BASE_DIR / "logs"
+EMAIL_HISTORY_DIR = BASE_DIR / "email_history"
+SENT_EMAILS_FILE = EMAIL_HISTORY_DIR / "sent_emails.txt"
+UNSENT_EMAILS_FILE = EMAIL_HISTORY_DIR / "unsent_emails.txt"
+INBOX_TEST_COUNTER_FILE = EMAIL_HISTORY_DIR / "inbox_test_counter.txt"
