@@ -201,13 +201,43 @@ class PcloudUi:
         for selector in selectors:
             locator = self.page.locator(selector).last
             try:
-                locator.wait_for(state="visible", timeout=1_200)
+                locator.wait_for(state="visible", timeout=2_500)
                 return locator
             except PlaywrightTimeoutError:
                 continue
         raise PcloudAutomationError(
             "Окно не открылось. Проверьте, что пункт Invite to Folder доступен."
         )
+
+    def _ensure_invite_tab(self, dialog: Locator) -> None:
+        tab_candidates = [
+            dialog.get_by_text(re.compile(r"^Invite to folder$", re.I)).first,
+            dialog.get_by_text(re.compile(r"^Invite$", re.I)).first,
+        ]
+        for tab in tab_candidates:
+            try:
+                if tab.count() > 0:
+                    tab.click(timeout=1_200)
+                    self.page.wait_for_timeout(120)
+                    return
+            except Exception:  # noqa: BLE001
+                continue
+
+    def _get_visible_email_input(self, dialog: Locator) -> Locator:
+        candidates = [
+            dialog.locator("input[name='emails']:visible").first,
+            dialog.locator("input.comboinput:visible").first,
+            dialog.locator("input[placeholder*='Name or Email' i]:visible").first,
+            dialog.locator("input[type='text']:visible").first,
+            dialog.locator("input:visible").first,
+        ]
+        for candidate in candidates:
+            try:
+                candidate.wait_for(state="visible", timeout=1_800)
+                return candidate
+            except PlaywrightTimeoutError:
+                continue
+        raise PcloudAutomationError("Не удалось найти видимое поле Name or Email в окне Invite.")
 
     def _folder_locator(self, folder_name: str) -> Locator:
         escaped = re.escape(folder_name.strip())
@@ -368,19 +398,36 @@ class PcloudUi:
     def invite_batch(self, folder_name: str, emails: list[str], message_text: str) -> None:
         self._open_invite_dialog(folder_name)
         dialog = self._visible_dialog()
-        email_input = dialog.locator("input[type='text'], input").first
-        email_input.wait_for(state="visible", timeout=2_500)
+        self._ensure_invite_tab(dialog)
 
         for email in emails:
-            email_input.click()
-            email_input.fill(email)
-            email_input.press("Enter")
-            self.page.wait_for_timeout(70)
+            sent = False
+            for _ in range(3):
+                try:
+                    email_input = self._get_visible_email_input(dialog)
+                    email_input.click(timeout=1_200)
+                    email_input.fill(email, timeout=1_200)
+                    email_input.press("Enter")
+                    self.page.wait_for_timeout(120)
+                    sent = True
+                    break
+                except Exception:  # noqa: BLE001
+                    self.page.wait_for_timeout(220)
+            if not sent:
+                raise PcloudAutomationError(f"Не удалось добавить email: {email}")
 
         if message_text:
-            message_area = dialog.locator("textarea").first
-            if message_area.count() > 0:
-                message_area.fill(message_text)
+            message_candidates = [
+                dialog.locator("textarea:visible").first,
+                dialog.locator("textarea").first,
+            ]
+            for message_area in message_candidates:
+                try:
+                    if message_area.count() > 0:
+                        message_area.fill(message_text, timeout=1_500)
+                        break
+                except Exception:  # noqa: BLE001
+                    continue
 
         share_candidates = [
             dialog.get_by_role("button", name=re.compile(r"^Share$", re.I)).first,
