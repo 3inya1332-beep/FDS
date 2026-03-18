@@ -240,6 +240,50 @@ class PcloudUi:
     def __init__(self, page: Page) -> None:
         self.page = page
 
+    def _dismiss_blocking_overlays(self) -> None:
+        close_selectors = [
+            "button[aria-label*='close' i]:visible",
+            "[role='button'][aria-label*='close' i]:visible",
+            "button:has-text('Close'):visible",
+            "button:has-text('Not now'):visible",
+            "button:has-text('Позже'):visible",
+            "button:has-text('Отмена'):visible",
+            ".Modal__FadeTranstionContainer-sc-4ci1nh-13 a:has-text('×'):visible",
+            ".Modal__FadeTranstionContainer-sc-4ci1nh-13 button:visible",
+        ]
+        overlay_selector = (
+            ".Modal__Overlay-sc-4ci1nh-0:visible, "
+            ".Modal__FadeTranstionContainer-sc-4ci1nh-13:visible, "
+            ".modal:visible, [role='dialog']:visible, .visitor:visible, .popup:visible"
+        )
+
+        for _ in range(3):
+            try:
+                self.page.keyboard.press("Escape")
+            except Exception:  # noqa: BLE001
+                pass
+            self.page.wait_for_timeout(45)
+
+            clicked_close = False
+            for selector in close_selectors:
+                button = self.page.locator(selector).first
+                try:
+                    button.click(timeout=300, force=True)
+                    clicked_close = True
+                    self.page.wait_for_timeout(60)
+                    break
+                except Exception:  # noqa: BLE001
+                    continue
+
+            try:
+                if self.page.locator(overlay_selector).count() == 0:
+                    return
+            except Exception:  # noqa: BLE001
+                return
+
+            if not clicked_close:
+                self.page.wait_for_timeout(90)
+
     def force_desktop_view(self) -> None:
         # Some ADS profiles open with small/mobile viewport.
         try:
@@ -322,7 +366,18 @@ class PcloudUi:
 
     def _folder_locator(self, folder_name: str) -> Locator:
         escaped = re.escape(folder_name.strip())
-        return self.page.get_by_text(re.compile(rf"^\s*{escaped}\s*$")).first
+        by_text = self.page.get_by_text(re.compile(rf"^\s*{escaped}\s*$")).first
+        grid_name = self.page.locator("div[class*='GridItemName']", has_text=folder_name).first
+        grid_folder = self.page.locator(
+            "div.itemFolder, div[class*='itemFolder'], div[class*='GridCellWrapper']",
+            has=grid_name,
+        ).first
+        try:
+            if grid_folder.count() > 0:
+                return grid_folder
+        except Exception:  # noqa: BLE001
+            pass
+        return by_text
 
     def _ensure_folder_visible(self, folder_name: str, timeout: int = UI_SHORT_TIMEOUT) -> Locator:
         locator = self._folder_locator(folder_name)
@@ -374,6 +429,7 @@ class PcloudUi:
         )
 
     def create_folder(self, folder_name: str) -> bool:
+        self._dismiss_blocking_overlays()
         try:
             self._ensure_folder_visible(folder_name, timeout=2_500)
             return False
@@ -444,13 +500,25 @@ class PcloudUi:
         return True
 
     def _open_folder_context_menu(self, folder_name: str) -> Locator:
+        self._dismiss_blocking_overlays()
         folder_label = self._ensure_folder_visible(folder_name, timeout=UI_MEDIUM_TIMEOUT)
         folder_label.scroll_into_view_if_needed()
-        folder_label.click(button="right")
-        self.page.wait_for_timeout(70)
+        try:
+            folder_label.click(button="right", force=True, timeout=1_100)
+        except Exception:  # noqa: BLE001
+            box = folder_label.bounding_box()
+            if box is None:
+                raise PcloudAutomationError(f'Не удалось открыть меню папки "{folder_name}".')
+            self.page.mouse.click(
+                box["x"] + box["width"] * 0.5,
+                box["y"] + box["height"] * 0.5,
+                button="right",
+            )
+        self.page.wait_for_timeout(50)
         return folder_label
 
     def _open_invite_dialog(self, folder_name: str) -> None:
+        self._dismiss_blocking_overlays()
         self._open_folder_context_menu(folder_name)
         invite_item = self.page.get_by_text(re.compile(r"^Invite to Folder$", re.I)).first
         try:
