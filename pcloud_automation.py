@@ -67,6 +67,7 @@ T = TypeVar("T")
 UI_SHORT_TIMEOUT = 4_200
 UI_MEDIUM_TIMEOUT = 6_500
 UI_STEP_DELAY_MS = 90
+_ACTIVE_ADS_SESSIONS: dict[str, AdsBrowserSession] = {}
 
 
 def _resolve_or_create_dir(candidates: list[Path]) -> Path:
@@ -234,6 +235,40 @@ def _chunked(items: Iterable[str], size: int) -> list[list[str]]:
 def _say(message: str) -> None:
     print(f"✨ {message}", flush=True)
     _write_log(message)
+
+
+def _get_or_start_ads_session(profile: Profile, ads_client: AdsApiClient) -> AdsBrowserSession:
+    profile_id = profile.ads_profile_id.strip()
+    cached = _ACTIVE_ADS_SESSIONS.get(profile_id)
+    if cached is not None:
+        _say("Использую уже открытый ADS профиль.")
+        return cached
+
+    _say("Запускаю профиль ADS Browser...")
+    session = ads_client.start_browser(
+        profile_id=profile_id,
+        headless=ADS_HEADLESS,
+        open_tabs=ADS_OPEN_TABS,
+    )
+    _ACTIVE_ADS_SESSIONS[profile_id] = session
+    return session
+
+
+def _force_restart_ads_session(profile: Profile, ads_client: AdsApiClient) -> AdsBrowserSession:
+    profile_id = profile.ads_profile_id.strip()
+    _ACTIVE_ADS_SESSIONS.pop(profile_id, None)
+    try:
+        ads_client.stop_browser(profile_id)
+    except Exception:  # noqa: BLE001
+        pass
+    _say("Перезапускаю ADS профиль из-за ошибки подключения...")
+    session = ads_client.start_browser(
+        profile_id=profile_id,
+        headless=ADS_HEADLESS,
+        open_tabs=ADS_OPEN_TABS,
+    )
+    _ACTIVE_ADS_SESSIONS[profile_id] = session
+    return session
 
 
 class PcloudUi:
@@ -606,19 +641,20 @@ def _run_in_ads_browser(profile: Profile, worker: Callable[[PcloudUi], T]) -> T:
         )
 
     ads_client = AdsApiClient()
-    ads_session = None
+    ads_session: AdsBrowserSession | None = None
     page: Page | None = None
+    browser = None
 
     try:
-        _say("Запускаю профиль ADS Browser...")
-        ads_session = ads_client.start_browser(
-            profile_id=profile.ads_profile_id,
-            headless=ADS_HEADLESS,
-            open_tabs=ADS_OPEN_TABS,
-        )
+        ads_session = _get_or_start_ads_session(profile, ads_client)
 
         with sync_playwright() as playwright:
-            browser = playwright.chromium.connect_over_cdp(ads_session.cdp_url)
+            try:
+                browser = playwright.chromium.connect_over_cdp(ads_session.cdp_url)
+            except Exception:  # noqa: BLE001
+                ads_session = _force_restart_ads_session(profile, ads_client)
+                browser = playwright.chromium.connect_over_cdp(ads_session.cdp_url)
+
             context = browser.contexts[0] if browser.contexts else browser.new_context()
             page = context.pages[0] if context.pages else context.new_page()
             page.set_default_timeout(UI_SHORT_TIMEOUT)
@@ -629,11 +665,20 @@ def _run_in_ads_browser(profile: Profile, worker: Callable[[PcloudUi], T]) -> T:
             ui.open_home(profile.start_url or DEFAULT_PCLOUD_URL)
             ui.force_desktop_view()
             result = worker(ui)
-            browser.close()
+            # Disconnect only from CDP session; do not stop ADS profile.
+            if browser is not None:
+                try:
+                    browser.close()
+                except Exception:  # noqa: BLE001
+                    pass
             return result
     except AdsApiError:
+        if ads_session is not None:
+            _ACTIVE_ADS_SESSIONS.pop(ads_session.profile_id, None)
         raise
     except Exception as exc:  # noqa: BLE001
+        if ads_session is not None:
+            _ACTIVE_ADS_SESSIONS.pop(ads_session.profile_id, None)
         if page is not None:
             try:
                 LOGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -646,9 +691,6 @@ def _run_in_ads_browser(profile: Profile, worker: Callable[[PcloudUi], T]) -> T:
             "Не получилось нажать нужные кнопки на странице. "
             "Проверьте, что открыт обычный интерфейс My pCloud."
         ) from exc
-    finally:
-        if ads_session is not None:
-            ads_client.stop_browser(ads_session.profile_id)
 
 
 def setup_folder(profile: Profile) -> SetupStats:
@@ -659,6 +701,10 @@ def setup_folder(profile: Profile) -> SetupStats:
     def worker(ui: PcloudUi) -> SetupStats:
         _say("Пробую создать папку...")
         created = ui.create_folder(folder_name)
+        if created:
+            _say("Папка создана.")
+        else:
+            _say("Папка уже есть.")
         return SetupStats(folder_name=folder_name, folder_created=created)
 
     stats = _run_in_ads_browser(profile, worker)
