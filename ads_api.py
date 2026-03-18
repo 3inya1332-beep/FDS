@@ -7,7 +7,14 @@ from urllib.parse import urlparse
 
 import requests
 
-from config import ADS_REQUEST_PAUSE_SECONDS, ADS_TIMEOUT_SECONDS, API_KEY, LOCAL_API_BASE
+from config import (
+    ADS_FALLBACK_BASE_URLS,
+    ADS_MAX_RETRIES_PER_URL,
+    ADS_REQUEST_PAUSE_SECONDS,
+    ADS_TIMEOUT_SECONDS,
+    API_KEY,
+    LOCAL_API_BASE,
+)
 
 
 class AdsApiError(RuntimeError):
@@ -31,14 +38,31 @@ class AdsApiClient:
         self.api_key = api_key.strip()
         self.timeout_seconds = timeout_seconds
 
+    def _base_urls(self) -> list[str]:
+        urls = [self.base_url, *ADS_FALLBACK_BASE_URLS]
+        deduped: list[str] = []
+        for url in urls:
+            normalized = url.rstrip("/")
+            if normalized and normalized not in deduped:
+                deduped.append(normalized)
+        return deduped
+
     def _api_key_ready(self) -> bool:
         return bool(self.api_key and self.api_key != "PASTE_YOUR_ADS_API_KEY")
 
+    def _bearer_value(self) -> str | None:
+        if not self._api_key_ready():
+            return None
+        if self.api_key.lower().startswith("bearer "):
+            return self.api_key
+        return f"Bearer {self.api_key}"
+
     def _headers(self) -> dict[str, str]:
         headers = {"Accept": "application/json"}
-        if self._api_key_ready():
+        bearer = self._bearer_value()
+        if bearer:
             # AdsPower Local API expects Authorization: Bearer <api_key>.
-            headers["Authorization"] = f"Bearer {self.api_key}"
+            headers["Authorization"] = bearer
             # Compatibility fallbacks for alternate ADS builds.
             headers["X-API-KEY"] = self.api_key
             headers["api-key"] = self.api_key
@@ -49,28 +73,65 @@ class AdsApiClient:
         method: str,
         path: str,
         params: dict[str, Any] | None = None,
+        include_query_key: bool = False,
         **kwargs: Any,
     ) -> dict[str, Any]:
         final_params = dict(params or {})
         # Some ADS API builds expect api-key in query params.
-        if self._api_key_ready():
+        if include_query_key and self._api_key_ready():
             final_params.setdefault("api_key", self.api_key)
             final_params.setdefault("api-key", self.api_key)
 
-        url = f"{self.base_url}{path}"
-        response = requests.request(
-            method=method.upper(),
-            url=url,
-            timeout=self.timeout_seconds,
-            headers=self._headers(),
-            params=final_params,
-            **kwargs,
+        errors: list[str] = []
+        for base_url in self._base_urls():
+            for attempt in range(1, ADS_MAX_RETRIES_PER_URL + 1):
+                url = f"{base_url}{path}"
+                try:
+                    response = requests.request(
+                        method=method.upper(),
+                        url=url,
+                        timeout=self.timeout_seconds,
+                        headers=self._headers(),
+                        params=final_params,
+                        **kwargs,
+                    )
+                except requests.RequestException as exc:
+                    errors.append(f"{method} {url} network error: {exc}")
+                    if attempt < ADS_MAX_RETRIES_PER_URL:
+                        time.sleep(ADS_REQUEST_PAUSE_SECONDS * attempt)
+                    continue
+
+                if response.status_code == 503:
+                    errors.append(f"{method} {url} -> 503 Service Unavailable")
+                    if attempt < ADS_MAX_RETRIES_PER_URL:
+                        time.sleep(ADS_REQUEST_PAUSE_SECONDS * attempt)
+                    continue
+
+                if response.status_code >= 500:
+                    errors.append(f"{method} {url} -> HTTP {response.status_code}")
+                    if attempt < ADS_MAX_RETRIES_PER_URL:
+                        time.sleep(ADS_REQUEST_PAUSE_SECONDS * attempt)
+                    continue
+
+                if response.status_code >= 400:
+                    raise AdsApiError(
+                        f"ADS API HTTP {response.status_code} for {method} {url}: {response.text[:500]}"
+                    )
+
+                try:
+                    payload = response.json()
+                except Exception as exc:  # noqa: BLE001
+                    raise AdsApiError(f"ADS API returned non-JSON response for {method} {url}: {exc}") from exc
+
+                if isinstance(payload, dict):
+                    return payload
+                raise AdsApiError(f"Unexpected ADS API response: {payload!r}")
+
+        raise AdsApiError(
+            "ADS Local API недоступен (503/connection). Проверьте, что AdsPower запущен, "
+            "Local API включен, и порт 50325 доступен. "
+            f"Детали: {' | '.join(errors)}"
         )
-        response.raise_for_status()
-        payload = response.json()
-        if isinstance(payload, dict):
-            return payload
-        raise AdsApiError(f"Unexpected ADS API response: {payload!r}")
 
     @staticmethod
     def _msg(payload: dict[str, Any]) -> str:
@@ -80,7 +141,13 @@ class AdsApiClient:
         return str(payload)
 
     def _request_success_or_raise(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
-        response_payload = self._request(method, path, **kwargs)
+        response_payload = self._request(method, path, include_query_key=False, **kwargs)
+        msg = self._msg(response_payload)
+        lowered = msg.lower()
+        if "require api-key" in lowered or "require api key" in lowered:
+            # Some builds require api-key in query, retry once in compatibility mode.
+            response_payload = self._request(method, path, include_query_key=True, **kwargs)
+
         if self._is_success(response_payload):
             return response_payload
 
@@ -150,6 +217,11 @@ class AdsApiClient:
             (
                 "GET",
                 "/api/v1/browser/start",
+                {"params": {"user_id": profile_id}},
+            ),
+            (
+                "GET",
+                "/api/v1/browser/start",
                 {"params": {"user_id": profile_id, "headless": int(headless), "open_tabs": open_tabs}},
             ),
             (
@@ -166,6 +238,16 @@ class AdsApiClient:
                 "POST",
                 "/api/v1/browser/start",
                 {"json": {"profile_id": profile_id, "headless": int(headless), "open_tabs": open_tabs}},
+            ),
+            (
+                "GET",
+                "/api/v1/browser/start",
+                {"params": {"serial_number": profile_id}},
+            ),
+            (
+                "POST",
+                "/api/v1/browser/start",
+                {"json": {"serial_number": profile_id}},
             ),
         ]
 
@@ -197,7 +279,7 @@ class AdsApiClient:
         ]
         for method, path, kwargs in stop_variants:
             try:
-                self._request(method, path, **kwargs)
+                self._request(method, path, include_query_key=False, **kwargs)
                 return
             except Exception:  # noqa: BLE001
                 continue

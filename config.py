@@ -6,11 +6,17 @@ BASE_DIR = Path(__file__).resolve().parent
 # For AdsPower Local API, "http://local.adspower.net:50325" is the canonical host.
 # If your setup uses 127.0.0.1, you can keep "http://127.0.0.1:50325".
 LOCAL_API_BASE = "http://local.adspower.net:50325"
+ADS_FALLBACK_BASE_URLS = [
+    "http://127.0.0.1:50325",
+    "http://localhost:50325",
+    "http://local.adspower.net:50325",
+]
 API_KEY = "PASTE_YOUR_ADS_API_KEY"
 ADS_TIMEOUT_SECONDS = 60
 ADS_HEADLESS = False
 ADS_OPEN_TABS = 1
 ADS_REQUEST_PAUSE_SECONDS = 0.8
+ADS_MAX_RETRIES_PER_URL = 2
 
 # pCloud automation defaults
 DEFAULT_PCLOUD_URL = "https://my.pcloud.com/"
