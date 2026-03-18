@@ -178,9 +178,27 @@ class PcloudUi:
         return has_password and has_email
 
     def _visible_dialog(self) -> Locator:
-        dialog = self.page.locator('div[role="dialog"]:visible, .modal:visible').last
-        dialog.wait_for(state="visible", timeout=20_000)
-        return dialog
+        selectors = [
+            'div[role="dialog"]:visible',
+            '.modal:visible',
+            '.visitor:visible',
+            "[class*='dialog']:visible",
+            "[class*='modal']:visible",
+            ".popup:visible",
+        ]
+        errors: list[str] = []
+        for selector in selectors:
+            locator = self.page.locator(selector).last
+            try:
+                locator.wait_for(state="visible", timeout=4_000)
+                return locator
+            except PlaywrightTimeoutError:
+                errors.append(selector)
+                continue
+        raise PcloudAutomationError(
+            "Не удалось найти диалоговое окно pCloud после клика. "
+            f"Пробовал селекторы: {', '.join(errors)}"
+        )
 
     def _folder_locator(self, folder_name: str) -> Locator:
         escaped = re.escape(folder_name.strip())
@@ -201,6 +219,11 @@ class PcloudUi:
             ) from exc
 
     def _find_add_button(self) -> Locator:
+        try:
+            self.page.evaluate("window.scrollTo(0, 0)")
+        except Exception:  # noqa: BLE001
+            pass
+
         candidates = [
             self.page.get_by_role("button", name=re.compile(r"^(Add|New|Создать)$", re.I)).first,
             self.page.get_by_text(re.compile(r"^(Add|Создать)$", re.I)).first,
@@ -246,17 +269,60 @@ class PcloudUi:
             self.page.mouse.click(view["width"] - 75, 48)
             self.page.wait_for_timeout(700)
 
-        folder_menu_item = self.page.get_by_text(re.compile(r"^(Folder|Папка)$", re.I)).first
-        folder_menu_item.wait_for(state="visible", timeout=12_000)
+        folder_menu_candidates = [
+            self.page.get_by_text(re.compile(r"^(New Folder|Новая папка)$", re.I)).first,
+            self.page.get_by_text(re.compile(r"^(Folder|Папка)$", re.I)).first,
+        ]
+        folder_menu_item: Locator | None = None
+        for candidate in folder_menu_candidates:
+            try:
+                candidate.wait_for(state="visible", timeout=5_000)
+                folder_menu_item = candidate
+                break
+            except PlaywrightTimeoutError:
+                continue
+
+        if folder_menu_item is None:
+            raise PcloudAutomationError(
+                "После клика Add не найден пункт New Folder/Folder в выпадающем меню."
+            )
         folder_menu_item.click()
 
-        dialog = self._visible_dialog()
-        name_input = dialog.locator("input[type='text'], input").first
-        name_input.wait_for(state="visible", timeout=10_000)
-        name_input.fill(folder_name)
+        # Flow A: modal/visitor dialog with name input and create button.
+        try:
+            dialog = self._visible_dialog()
+            name_input = dialog.locator("input[type='text'], input").first
+            name_input.wait_for(state="visible", timeout=8_000)
+            name_input.fill(folder_name)
 
-        create_button = dialog.get_by_role("button", name=re.compile(r"Create|Save|OK", re.I)).first
-        create_button.click()
+            create_button = dialog.get_by_role(
+                "button",
+                name=re.compile(r"Create|Save|OK|Done|Готово|Создать", re.I),
+            ).first
+            try:
+                create_button.wait_for(state="visible", timeout=4_000)
+                create_button.click()
+            except PlaywrightTimeoutError:
+                name_input.press("Enter")
+        except Exception:  # noqa: BLE001
+            # Flow B: inline create input without modal.
+            inline_candidates = [
+                self.page.locator("input:visible[placeholder*='folder' i]").first,
+                self.page.locator("input:visible[placeholder*='папк' i]").first,
+                self.page.locator("input:visible[value*='New Folder' i]").first,
+                self.page.locator("input:visible[value*='Новая папка' i]").first,
+            ]
+            inline_input: Locator | None = None
+            for candidate in inline_candidates:
+                try:
+                    candidate.wait_for(state="visible", timeout=2_500)
+                    inline_input = candidate
+                    break
+                except PlaywrightTimeoutError:
+                    continue
+            if inline_input is not None:
+                inline_input.fill(folder_name)
+                inline_input.press("Enter")
 
         self._ensure_folder_visible(folder_name, timeout=25_000)
         return True
