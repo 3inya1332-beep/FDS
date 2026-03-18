@@ -30,8 +30,8 @@ def clear_console() -> None:
 
 def print_header() -> None:
     print("\n" + "═" * 66)
-    print("🌩️  ADS + pCloud AUTO INVITER")
-    print("✨ Быстрое создание папок и отправка приглашений")
+    print("🌩️  PCLOUD EVE SENDER")
+    print("✨ Быстрая отправка приглашений")
     print("═" * 66)
 
 

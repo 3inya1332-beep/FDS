@@ -72,9 +72,9 @@ class InboxCheckStats:
 
 
 T = TypeVar("T")
-UI_SHORT_TIMEOUT = 4_200
-UI_MEDIUM_TIMEOUT = 6_500
-UI_STEP_DELAY_MS = 90
+UI_SHORT_TIMEOUT = 3_600
+UI_MEDIUM_TIMEOUT = 5_500
+UI_STEP_DELAY_MS = 60
 _ACTIVE_ADS_SESSIONS: dict[str, AdsBrowserSession] = {}
 _PROXY_ROTATION_INDEX = 0
 
@@ -920,11 +920,6 @@ def send_invites(profile: Profile) -> RunStats:
                 _say(f"Пакет {index}: успешно.")
                 if index < len(batches):
                     _rotate_proxy_if_needed(len(batch))
-                    try:
-                        ui.page.reload(wait_until="domcontentloaded", timeout=12_000)
-                        ui.page.wait_for_timeout(120)
-                    except Exception:  # noqa: BLE001
-                        pass
             except Exception as batch_exc:  # noqa: BLE001
                 failed_batches += 1
                 _write_log(f"Batch failed ({len(batch)} emails): {batch_exc}")
