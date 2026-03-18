@@ -37,12 +37,20 @@ class AdsApiClient:
     def _headers(self) -> dict[str, str]:
         headers = {"Accept": "application/json"}
         if self._api_key_ready():
-            # Different ADS API builds may use one of these headers.
-            headers["Authorization"] = self.api_key
+            # AdsPower Local API expects Authorization: Bearer <api_key>.
+            headers["Authorization"] = f"Bearer {self.api_key}"
+            # Compatibility fallbacks for alternate ADS builds.
             headers["X-API-KEY"] = self.api_key
+            headers["api-key"] = self.api_key
         return headers
 
-    def _request(self, method: str, path: str, params: dict[str, Any] | None = None, **kwargs: Any) -> dict[str, Any]:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        params: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
         final_params = dict(params or {})
         # Some ADS API builds expect api-key in query params.
         if self._api_key_ready():
@@ -70,6 +78,25 @@ class AdsApiClient:
         if isinstance(msg, str):
             return msg
         return str(payload)
+
+    def _request_success_or_raise(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        response_payload = self._request(method, path, **kwargs)
+        if self._is_success(response_payload):
+            return response_payload
+
+        msg = self._msg(response_payload)
+        lowered = msg.lower()
+        if "require api-key" in lowered or "require api key" in lowered:
+            raise AdsApiError(
+                "ADS API требует ключ в формате Bearer. Проверьте config.py -> API_KEY "
+                "и что ключ включен в AdsPower (Automation -> API)."
+            )
+        if "too many request" in lowered:
+            raise AdsApiError(
+                "ADS API вернул лимит запросов (Too many request per second). "
+                "Повторите запуск через пару секунд."
+            )
+        raise AdsApiError(f"ADS API error: {response_payload}")
 
     @staticmethod
     def _extract_cdp_url(data: dict[str, Any]) -> str | None:
@@ -118,11 +145,17 @@ class AdsApiClient:
         open_tabs: int = 1,
     ) -> AdsBrowserSession:
         profile_id = profile_id.strip()
+        # Start with the canonical AdsPower v1 GET call.
         payload_variants = [
             (
                 "GET",
                 "/api/v1/browser/start",
                 {"params": {"user_id": profile_id, "headless": int(headless), "open_tabs": open_tabs}},
+            ),
+            (
+                "POST",
+                "/api/v1/browser/start",
+                {"json": {"user_id": profile_id, "headless": int(headless), "open_tabs": open_tabs}},
             ),
             (
                 "GET",
@@ -132,30 +165,14 @@ class AdsApiClient:
             (
                 "POST",
                 "/api/v1/browser/start",
-                {"json": {"user_id": profile_id, "headless": int(headless), "open_tabs": open_tabs}},
-            ),
-            (
-                "POST",
-                "/api/v1/browser/start",
                 {"json": {"profile_id": profile_id, "headless": int(headless), "open_tabs": open_tabs}},
             ),
         ]
 
         errors: list[str] = []
-        for method, path, kwargs in payload_variants:
+        for index, (method, path, kwargs) in enumerate(payload_variants):
             try:
-                response_payload = self._request(method, path, **kwargs)
-                if not self._is_success(response_payload):
-                    msg = self._msg(response_payload)
-                    lowered = msg.lower()
-                    errors.append(str(response_payload))
-                    if "require api-key" in lowered or "require api key" in lowered:
-                        raise AdsApiError(
-                            "ADS API требует api-key. Укажите ключ в config.py -> API_KEY"
-                        )
-                    if "too many request" in lowered:
-                        time.sleep(ADS_REQUEST_PAUSE_SECONDS)
-                    continue
+                response_payload = self._request_success_or_raise(method, path, **kwargs)
                 data = self._data_from_payload(response_payload)
                 cdp_url = self._extract_cdp_url(data)
                 if cdp_url:
@@ -165,7 +182,8 @@ class AdsApiClient:
                 raise
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"{method} {path} failed: {exc}")
-            time.sleep(ADS_REQUEST_PAUSE_SECONDS)
+            if index < len(payload_variants) - 1:
+                time.sleep(ADS_REQUEST_PAUSE_SECONDS)
 
         raise AdsApiError("Unable to start ADS browser profile. " + " | ".join(errors))
 

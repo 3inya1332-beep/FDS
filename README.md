@@ -32,7 +32,7 @@ pip install -r requirements.txt
 
 Откройте `config.py` и укажите:
 
-- `LOCAL_API_BASE` (обычно `http://127.0.0.1:50325`)
+- `LOCAL_API_BASE` (рекомендуется `http://local.adspower.net:50325`, альтернативно `http://127.0.0.1:50325`)
 - `API_KEY` (если используется вашей версией ADS)
 - при необходимости `ADS_HEADLESS`, `BATCH_SIZE`, `BATCH_DELAY_SECONDS`
 
@@ -64,4 +64,4 @@ python main.py
 
 - `API_KEY = "ВАШ_КЛЮЧ"`
 
-Скрипт отправляет ключ и в headers, и в query-параметрах (`api_key` / `api-key`) для совместимости с разными сборками ADS API.
+Скрипт отправляет ключ в формате `Authorization: Bearer <key>` и дополнительно в query-параметрах (`api_key` / `api-key`) для совместимости с разными сборками ADS API.

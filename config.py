@@ -3,7 +3,9 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
 
 # ADS Browser local API
-LOCAL_API_BASE = "http://127.0.0.1:50325"
+# For AdsPower Local API, "http://local.adspower.net:50325" is the canonical host.
+# If your setup uses 127.0.0.1, you can keep "http://127.0.0.1:50325".
+LOCAL_API_BASE = "http://local.adspower.net:50325"
 API_KEY = "PASTE_YOUR_ADS_API_KEY"
 ADS_TIMEOUT_SECONDS = 60
 ADS_HEADLESS = False
