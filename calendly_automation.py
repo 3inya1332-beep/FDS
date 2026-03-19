@@ -1414,10 +1414,49 @@ def configure_account_notifications(profile: Profile) -> str:
 
 
 def _is_booking_form_visible(page: Page) -> bool:
-    return (
-        page.locator("input[name='name'], input[aria-label*='Name' i]").count() > 0
-        and page.locator("input[name='email'], input[type='email']").count() > 0
-    )
+    try:
+        if (
+            page.locator("text=/Enter Details/i").count() > 0
+            and page.locator("button:has-text('Schedule Event')").count() > 0
+        ):
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+
+    selectors = [
+        "input[name='name']",
+        "input[aria-label*='name' i]",
+        "input[placeholder*='name' i]",
+        "xpath=//*[contains(., 'Name')]/following::input[1]",
+    ]
+    has_name = False
+    for selector in selectors:
+        try:
+            loc = page.locator(selector).first
+            if loc.count() > 0 and loc.is_visible():
+                has_name = True
+                break
+        except Exception:  # noqa: BLE001
+            continue
+
+    email_selectors = [
+        "input[name='email']",
+        "input[type='email']",
+        "input[aria-label*='email' i]",
+        "input[placeholder*='email' i]",
+        "xpath=//*[contains(., 'Email')]/following::input[1]",
+    ]
+    has_email = False
+    for selector in email_selectors:
+        try:
+            loc = page.locator(selector).first
+            if loc.count() > 0 and loc.is_visible():
+                has_email = True
+                break
+        except Exception:  # noqa: BLE001
+            continue
+
+    return has_name and has_email
 
 
 def _click_first_time_button(page: Page) -> bool:
@@ -1523,27 +1562,64 @@ def _select_first_available_time(page: Page, max_months_ahead: int = 6) -> bool:
 
 
 def _fill_booking_form(page: Page, invitee_name: str, invitee_email: str, guest_emails: list[str]) -> None:
-    if not _fill_first(
+    # Try strict selectors first.
+    name_filled = _fill_first(
         page,
         [
             "input[name='name']",
             "input[aria-label*='Name' i]",
+            "input[placeholder*='Name' i]",
+            "xpath=//*[contains(translate(.,'NAME','name'),'name')]/following::input[1]",
         ],
         invitee_name,
         timeout=20_000,
-    ):
+    )
+    if not name_filled:
+        # Fallback: first visible text input on form.
+        inputs = page.locator("input:not([type='hidden'])")
+        count = inputs.count()
+        for idx in range(min(count, 8)):
+            candidate = inputs.nth(idx)
+            try:
+                if candidate.is_visible():
+                    candidate.fill(invitee_name)
+                    name_filled = True
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+    if not name_filled:
         raise CalendlyAutomationError("Invitee Name input not found.")
 
-    if not _fill_first(
+    email_filled = _fill_first(
         page,
         [
             "input[name='email']",
             "input[type='email']",
             "input[aria-label*='Email' i]",
+            "input[placeholder*='Email' i]",
+            "xpath=//*[contains(translate(.,'EMAIL','email'),'email')]/following::input[1]",
         ],
         invitee_email,
         timeout=20_000,
-    ):
+    )
+    if not email_filled:
+        # Fallback: second visible text-like input on form.
+        inputs = page.locator("input:not([type='hidden'])")
+        count = inputs.count()
+        visible_indices: list[int] = []
+        for idx in range(min(count, 10)):
+            try:
+                if inputs.nth(idx).is_visible():
+                    visible_indices.append(idx)
+            except Exception:  # noqa: BLE001
+                continue
+        if len(visible_indices) >= 2:
+            try:
+                inputs.nth(visible_indices[1]).fill(invitee_email)
+                email_filled = True
+            except Exception:  # noqa: BLE001
+                pass
+    if not email_filled:
         raise CalendlyAutomationError("Invitee Email input not found.")
 
     if guest_emails:
@@ -1580,6 +1656,8 @@ def _fill_booking_form(page: Page, invitee_name: str, invitee_email: str, guest_
                     _pause(page, 40)
                 except Exception:  # noqa: BLE001
                     continue
+        else:
+            _progress("Guest input not found after Add Guests; continuing with main invitee email only.")
 
     if not _click_first(
         page,
