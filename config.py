@@ -1,10 +1,11 @@
+import os
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 
 # ADS Browser local API.
 LOCAL_API_BASE = "http://127.0.0.1:50325"
-API_KEY = "PASTE_YOUR_ADS_API_KEY"
+API_KEY = os.getenv("ADS_API_KEY", "PASTE_YOUR_ADS_API_KEY")
 ADS_TIMEOUT_SECONDS = 90
 ADS_HEADLESS = False
 ADS_OPEN_TABS = 1

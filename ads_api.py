@@ -36,22 +36,49 @@ class AdsApiClient:
             # Different ADS API builds may use one of these headers.
             headers["Authorization"] = self.api_key
             headers["X-API-KEY"] = self.api_key
+            headers["api-key"] = self.api_key
         return headers
+
+    def _auth_params(self) -> dict[str, str]:
+        if not self.api_key or self.api_key == "PASTE_YOUR_ADS_API_KEY":
+            return {}
+        # Different ADS builds expect different query names.
+        return {
+            "api-key": self.api_key,
+            "api_key": self.api_key,
+        }
 
     def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
         url = f"{self.base_url}{path}"
-        response = requests.request(
-            method=method.upper(),
-            url=url,
-            timeout=self.timeout_seconds,
-            headers=self._headers(),
-            **kwargs,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        if isinstance(payload, dict):
+        params = kwargs.pop("params", None) or {}
+        params.update(self._auth_params())
+        kwargs["params"] = params
+
+        retries = 4
+        for attempt in range(retries):
+            response = requests.request(
+                method=method.upper(),
+                url=url,
+                timeout=self.timeout_seconds,
+                headers=self._headers(),
+                **kwargs,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise AdsApiError(f"Unexpected ADS API response: {payload!r}")
+
+            msg = str(payload.get("msg", "")).lower()
+            if "too many request per second" in msg and attempt < retries - 1:
+                # ADS local API has strict QPS limits.
+                backoff = 0.7 * (2**attempt)
+                import time
+
+                time.sleep(backoff)
+                continue
             return payload
-        raise AdsApiError(f"Unexpected ADS API response: {payload!r}")
+
+        raise AdsApiError("ADS API request failed after retries")
 
     @staticmethod
     def _extract_cdp_url(data: dict[str, Any]) -> str | None:
@@ -100,6 +127,12 @@ class AdsApiClient:
         open_tabs: int = 1,
     ) -> AdsBrowserSession:
         profile_id = profile_id.strip()
+        if not self.api_key or self.api_key == "PASTE_YOUR_ADS_API_KEY":
+            raise AdsApiError(
+                "ADS API requires api-key. Set API_KEY in config.py "
+                "(or environment-specific value from your ADS Browser local API)."
+            )
+
         payload_variants = [
             (
                 "GET",
@@ -127,16 +160,32 @@ class AdsApiClient:
         for method, path, kwargs in payload_variants:
             try:
                 response_payload = self._request(method, path, **kwargs)
+                message = str(response_payload.get("msg", "")).lower()
+                if "require api-key" in message:
+                    raise AdsApiError(
+                        "ADS API returned 'Require api-key'. "
+                        "Set valid API_KEY in config.py and ensure local API accepts it."
+                    )
                 if not self._is_success(response_payload):
                     errors.append(str(response_payload))
+                    # Avoid hitting ADS rate limits while trying fallback payloads.
+                    import time
+
+                    time.sleep(0.7)
                     continue
                 data = self._data_from_payload(response_payload)
                 cdp_url = self._extract_cdp_url(data)
                 if cdp_url:
                     return AdsBrowserSession(profile_id=profile_id, cdp_url=cdp_url)
                 errors.append(f"CDP endpoint not found in payload: {response_payload}")
+                import time
+
+                time.sleep(0.7)
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"{method} {path} failed: {exc}")
+                import time
+
+                time.sleep(0.7)
 
         raise AdsApiError("Unable to start ADS browser profile. " + " | ".join(errors))
 

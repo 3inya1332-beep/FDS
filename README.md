@@ -30,6 +30,12 @@ playwright install chromium
 - `ANYMESSAGE_TOKEN` и параметры домена/site
 - параметры `NINEPROXY_*` (если нужна аварийная смена proxy)
 
+Также можно передать ADS ключ через переменную окружения:
+
+```bash
+export ADS_API_KEY="your_ads_local_api_key"
+```
+
 ## Запуск
 
 ```bash
