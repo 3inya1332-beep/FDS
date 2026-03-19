@@ -56,6 +56,7 @@ from config import (
     SIGNUP_INITIAL_DELAY_SECONDS,
     SIGNUP_LOAD_CHECK_TIMEOUT_SECONDS,
     SIGNUP_LOAD_MAX_RELOADS,
+    SIGNUP_WAIT_FOREVER_IF_NOT_READY,
     SUBJECT_FILENAME,
 )
 from profile_store import Profile
@@ -557,12 +558,16 @@ def _open_signup_page_with_recovery(page: Page) -> None:
     _progress(f"Opening signup page: {CALENDLY_SIGNUP_URL}")
     _safe_goto_calendly(page, CALENDLY_SIGNUP_URL, timeout_ms=45_000)
     start = time.time()
-    while time.time() - start < SIGNUP_LOAD_CHECK_TIMEOUT_SECONDS:
+    while True:
         if _signup_page_has_interactive_controls(page):
             _progress("Signup page ready.")
             return
+        waited = int(time.time() - start)
+        if not SIGNUP_WAIT_FOREVER_IF_NOT_READY and waited >= SIGNUP_LOAD_CHECK_TIMEOUT_SECONDS:
+            raise CalendlyAutomationError("Signup page did not become interactive in time.")
+        if waited > 0 and waited % 10 == 0:
+            _progress(f"Signup still loading... waited {waited}s")
         _pause(page, 80)
-    raise CalendlyAutomationError("Signup page did not become interactive in time.")
 
 
 def _fill_signup_form(page: Page, account_name: str, password: str, email: str) -> None:
