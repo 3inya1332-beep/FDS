@@ -289,7 +289,7 @@ def open_ads_page(ads_profile_id: str) -> Iterable[tuple[Page, BrowserContext]]:
         _progress(f"ADS profile {ads_profile_id} stopped")
 
 
-def _click_first(page: Page, selectors: list[str], timeout: int = 3_000) -> bool:
+def _click_first(page: Page, selectors: list[str], timeout: int = 1_500) -> bool:
     for selector in selectors:
         locator = page.locator(selector).first
         try:
@@ -304,7 +304,7 @@ def _click_first(page: Page, selectors: list[str], timeout: int = 3_000) -> bool
     return False
 
 
-def _fill_first(page: Page, selectors: list[str], value: str, timeout: int = 3_000) -> bool:
+def _fill_first(page: Page, selectors: list[str], value: str, timeout: int = 1_500) -> bool:
     for selector in selectors:
         locator = page.locator(selector).first
         try:
@@ -645,52 +645,81 @@ def _choose_random_labels(page: Page, labels: list[str], min_clicks: int = 1, ma
 
 def _click_next_until_progress(page: Page, retries: int = 4) -> bool:
     before = page.url
+    clicked_any = False
     for _ in range(retries):
         if _safe_click_next(page):
+            clicked_any = True
             _pause(page, 350)
             if page.url != before:
                 return True
         else:
             _pause(page, 200)
-    return page.url != before
+    return page.url != before or clicked_any
 
 
 def _configure_weekly_hours(page: Page) -> None:
-    # Requirement: enable first+last unavailable day with plus buttons,
+    # Requirement: enable first+last unavailable day with plus-buttons,
     # then set all day ranges to 12:00am - 12:00pm.
     _progress("Applying weekly hours: 12:00am - 12:00pm for all days.")
 
-    plus_candidates = [
-        "button[aria-label*='add' i]",
-        "button[title*='add' i]",
-        "xpath=(//div[normalize-space()='S']/following::button[1])[1]",
-        "xpath=(//div[normalize-space()='S']/following::button[1])[last()]",
-    ]
-    for selector in plus_candidates:
-        try:
-            locator = page.locator(selector)
-            count = locator.count()
-            if count == 0:
-                continue
-            if count == 1:
-                locator.first.click(timeout=1_500)
-                _pause(page, 80)
-            else:
-                locator.first.click(timeout=1_500)
-                _pause(page, 80)
-                locator.last.click(timeout=1_500)
-                _pause(page, 80)
-        except Exception:  # noqa: BLE001
-            continue
+    # Try to click plus on first and last unavailable rows.
+    try:
+        unavailable_row_buttons = page.locator(
+            "xpath=//*[contains(translate(normalize-space(.),'UNAVAILABLE','unavailable'),'unavailable')]/ancestor::*[self::div or self::li][1]//button"
+        )
+        cnt = unavailable_row_buttons.count()
+        if cnt >= 1:
+            unavailable_row_buttons.first.click(timeout=1_200)
+            _pause(page, 50)
+        if cnt >= 2:
+            unavailable_row_buttons.last.click(timeout=1_200)
+            _pause(page, 50)
+    except Exception:  # noqa: BLE001
+        pass
 
-    # Fill all visible time inputs in start/end pairs.
+    # JS fast-fill all visible time fields in start/end pairs.
+    try:
+        filled_count = page.evaluate(
+            """
+            () => {
+              const isVisible = (el) => {
+                const r = el.getBoundingClientRect();
+                const s = window.getComputedStyle(el);
+                return r.width > 30 && r.height > 18 && s.display !== 'none' && s.visibility !== 'hidden';
+              };
+              const inputs = Array.from(document.querySelectorAll('input')).filter((el) => {
+                const val = (el.value || '').toLowerCase();
+                const ph = (el.placeholder || '').toLowerCase();
+                const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+                return isVisible(el) && (val.includes(':') || ph.includes('time') || aria.includes('time'));
+              });
+              const max = Math.min(inputs.length, 14);
+              for (let i = 0; i < max; i += 1) {
+                const target = i % 2 === 0 ? '12:00am' : '12:00pm';
+                const el = inputs[i];
+                el.focus();
+                el.value = target;
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+              }
+              return max;
+            }
+            """
+        )
+        if isinstance(filled_count, int) and filled_count >= 2:
+            _progress(f"Weekly hours filled via JS inputs: {filled_count}")
+            return
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Manual fallback.
     time_inputs = page.locator("input[value*=':'], input[placeholder*=':'], input[aria-label*='time' i]")
     count = time_inputs.count()
     if count < 2:
         return
 
     def fill_time(input_locator: Locator, value: str) -> None:
-        input_locator.click(timeout=1_500)
+        input_locator.click(timeout=1_200)
         page.keyboard.press("Control+A")
         page.keyboard.type(value, delay=0)
         page.keyboard.press("Enter")
@@ -698,13 +727,24 @@ def _configure_weekly_hours(page: Page) -> None:
     max_inputs = min(count, 14)  # 7 days * 2 columns
     for index in range(max_inputs):
         try:
-            if index % 2 == 0:
-                fill_time(time_inputs.nth(index), "12:00am")
-            else:
-                fill_time(time_inputs.nth(index), "12:00pm")
-            _pause(page, 40)
+            fill_time(time_inputs.nth(index), "12:00am" if index % 2 == 0 else "12:00pm")
+            _pause(page, 20)
         except Exception:  # noqa: BLE001
             continue
+
+
+def _wait_for_availability_screen(page: Page, timeout_ms: int = 8_000) -> bool:
+    started = time.time()
+    while (time.time() - started) * 1000 < timeout_ms:
+        if (
+            page.locator("text=/When are you available to meet with people/i").count() > 0
+            or page.locator("text=/Weekly hours/i").count() > 0
+            or page.locator("input[value*='am'], input[value*='pm']").count() >= 2
+            or "/app/intro/availability" in page.url
+        ):
+            return True
+        _pause(page, 120)
+    return False
 
 
 def _complete_onboarding(page: Page) -> None:
@@ -762,6 +802,10 @@ def _complete_onboarding(page: Page) -> None:
         ):
             _progress("Calendar connect step detected, skipping via Next.")
             _click_next_until_progress(page, retries=5)
+            if _wait_for_availability_screen(page, timeout_ms=10_000):
+                _progress("Availability screen reached after Google step.")
+                _configure_weekly_hours(page)
+                _click_next_until_progress(page, retries=6)
             continue
 
         if (
@@ -895,32 +939,38 @@ def _open_event_editor_panel(page: Page) -> bool:
     _dismiss_cookie_banner(page)
     _pause(page, 120)
 
-    # Fast path: click the first event card title.
-    event_title = page.get_by_text(re.compile(r"\d+\s*Minute Meeting|Meeting", re.I)).first
+    # Must use three-dots menu at the right side of meeting card.
+    meeting_row = page.locator("div:has-text('Minute Meeting'), div:has-text('Meeting')").first
     try:
-        event_title.wait_for(state="visible", timeout=4_000)
-        event_title.click()
-        _pause(page, 250)
-        if page.locator("text=/Event type/i").count() > 0 or page.locator("text=/More options/i").count() > 0:
-            return True
+        meeting_row.wait_for(state="visible", timeout=4_000)
+        meeting_row.scroll_into_view_if_needed()
+        meeting_row.hover(timeout=2_000)
     except Exception:  # noqa: BLE001
         pass
 
-    # Fallback: hover card and use three dots -> Edit.
+    menu_clicked = False
+    # 1) Dedicated three dots near "Copy link".
     try:
-        event_title.hover(timeout=2_000)
+        row_menu = meeting_row.locator("button[aria-haspopup='menu'], button[aria-label*='more' i]").last
+        row_menu.click(timeout=2_500)
+        menu_clicked = True
     except Exception:  # noqa: BLE001
-        pass
+        menu_clicked = False
 
-    if _click_first(
-        page,
-        [
-            "button:right-of(:text('Copy link'))",
-            "button[aria-label*='more' i]",
-            "button[aria-haspopup='menu']",
-        ],
-        timeout=4_000,
-    ):
+    # 2) XPath fallback anchored to Copy link button.
+    if not menu_clicked:
+        menu_clicked = _click_first(
+            page,
+            [
+                "xpath=(//button[contains(., 'Copy link')]/following::button[1])[1]",
+                "button:right-of(:text('Copy link'))",
+                "button[aria-label*='more' i]",
+                "button[aria-haspopup='menu']",
+            ],
+            timeout=3_000,
+        )
+
+    if menu_clicked:
         if _click_first(
             page,
             [
@@ -928,7 +978,7 @@ def _open_event_editor_panel(page: Page) -> bool:
                 "text=Edit",
                 "button:has-text('Edit')",
             ],
-            timeout=4_000,
+            timeout=3_000,
         ):
             _pause(page, 250)
             return True
