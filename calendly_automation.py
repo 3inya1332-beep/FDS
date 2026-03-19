@@ -436,7 +436,7 @@ def _safe_click_next(page: Page) -> bool:
             "button:has-text('Continue')",
             "button[type='submit']",
         ],
-        timeout=6_000,
+        timeout=1_200,
     )
 
 
@@ -494,7 +494,7 @@ def _click_create_with_password(page: Page) -> None:
             "button:has-text('Click here')",
             "text=Prefer to create an account with a password?",
         ],
-        timeout=10_000,
+        timeout=1_500,
     )
     if not clicked:
         raise CalendlyAutomationError("Could not switch signup flow to password mode.")
@@ -607,12 +607,15 @@ def _click_label_option(page: Page, label: str) -> bool:
     for selector in selectors:
         locator = page.locator(selector).first
         try:
-            locator.wait_for(state="visible", timeout=2_500)
+            if locator.count() == 0:
+                continue
+            if not locator.is_visible():
+                continue
             locator.scroll_into_view_if_needed()
             try:
-                locator.click(timeout=2_500)
+                locator.click(timeout=700)
             except Exception:  # noqa: BLE001
-                locator.click(timeout=2_500, force=True)
+                locator.click(timeout=700, force=True)
             return True
         except Exception:  # noqa: BLE001
             continue
@@ -620,8 +623,11 @@ def _click_label_option(page: Page, label: str) -> bool:
     # Additional fallback by plain text node.
     text_node = page.get_by_text(re.compile(re.escape(label), re.I)).first
     try:
-        text_node.wait_for(state="visible", timeout=2_000)
-        text_node.click()
+        if text_node.count() == 0:
+            raise RuntimeError("not found")
+        if not text_node.is_visible():
+            raise RuntimeError("not visible")
+        text_node.click(timeout=700)
         return True
     except Exception:  # noqa: BLE001
         pass
@@ -679,11 +685,11 @@ def _click_next_until_progress(page: Page, retries: int = 4) -> bool:
     for _ in range(retries):
         if _safe_click_next(page):
             clicked_any = True
-            _pause(page, 350)
+            _pause(page, 120)
             if page.url != before:
                 return True
         else:
-            _pause(page, 200)
+            _pause(page, 80)
     return page.url != before or clicked_any
 
 
@@ -704,6 +710,31 @@ def _configure_weekly_hours(page: Page) -> None:
         if cnt >= 2:
             unavailable_row_buttons.last.click(timeout=1_200)
             _pause(page, 50)
+    except Exception:  # noqa: BLE001
+        pass
+
+    # JS fallback: click first and last add-buttons on rows without time inputs.
+    try:
+        page.evaluate(
+            """
+            () => {
+              const rows = Array.from(document.querySelectorAll('div, li')).filter((row) => {
+                const txt = (row.innerText || '').trim();
+                if (!txt) return false;
+                const hasDay = /^[SMTWF]/i.test(txt) || /unavailable/i.test(txt.toLowerCase());
+                const hasInput = row.querySelector('input');
+                const btns = row.querySelectorAll('button');
+                return hasDay && !hasInput && btns.length > 0;
+              });
+              if (!rows.length) return;
+              const firstBtn = rows[0].querySelector('button');
+              const lastBtn = rows[rows.length - 1].querySelector('button');
+              if (firstBtn) firstBtn.click();
+              if (lastBtn && lastBtn !== firstBtn) lastBtn.click();
+            }
+            """
+        )
+        _pause(page, 50)
     except Exception:  # noqa: BLE001
         pass
 
@@ -763,7 +794,7 @@ def _configure_weekly_hours(page: Page) -> None:
             continue
 
 
-def _wait_for_availability_screen(page: Page, timeout_ms: int = 8_000) -> bool:
+def _wait_for_availability_screen(page: Page, timeout_ms: int = 2_500) -> bool:
     started = time.time()
     while (time.time() - started) * 1000 < timeout_ms:
         if (
@@ -773,21 +804,41 @@ def _wait_for_availability_screen(page: Page, timeout_ms: int = 8_000) -> bool:
             or "/app/intro/availability" in page.url
         ):
             return True
-        _pause(page, 120)
+        _pause(page, 70)
     return False
+
+
+def _fast_back_from_google(page: Page) -> None:
+    try:
+        page.go_back(wait_until="commit", timeout=4_000)
+        return
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        page.evaluate("history.back()")
+        _pause(page, 120)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _complete_onboarding(page: Page) -> None:
     _progress("Onboarding flow started.")
+    availability_configured = False
     for _ in range(20):
-        if "/app/scheduling/meeting_types/" in page.url:
+        if "/app/scheduling/meeting_types/" in page.url and availability_configured:
             _progress("Onboarding completed.")
             return
+        if "/app/scheduling/meeting_types/" in page.url and not availability_configured:
+            _progress("Meeting types reached before availability setup, forcing availability page.")
+            try:
+                page.goto("https://calendly.com/app/intro/availability", wait_until="domcontentloaded", timeout=30_000)
+            except Exception:  # noqa: BLE001
+                pass
 
         if "accounts.google.com" in page.url:
             _progress("Google auth page detected, going back.")
-            page.go_back(wait_until="domcontentloaded")
-            _pause(page, 120)
+            _fast_back_from_google(page)
+            _pause(page, 80)
             _click_next_until_progress(page, retries=2)
             continue
 
@@ -832,9 +883,10 @@ def _complete_onboarding(page: Page) -> None:
         ):
             _progress("Calendar connect step detected, skipping via Next.")
             _click_next_until_progress(page, retries=5)
-            if _wait_for_availability_screen(page, timeout_ms=10_000):
+            if _wait_for_availability_screen(page, timeout_ms=3_000):
                 _progress("Availability screen reached after Google step.")
                 _configure_weekly_hours(page)
+                availability_configured = True
                 _click_next_until_progress(page, retries=6)
             continue
 
@@ -845,6 +897,7 @@ def _complete_onboarding(page: Page) -> None:
         ):
             _progress("Configuring weekly hours.")
             _configure_weekly_hours(page)
+            availability_configured = True
             _click_next_until_progress(page, retries=6)
             continue
 
@@ -960,6 +1013,7 @@ def _dismiss_cookie_banner(page: Page) -> None:
             "button:has-text('Allow all')",
             "button:has-text('Got it')",
             "button[aria-label*='close' i]",
+            "button:has-text('×')",
         ],
         timeout=1_500,
     )
@@ -969,25 +1023,19 @@ def _open_event_editor_panel(page: Page) -> bool:
     _dismiss_cookie_banner(page)
     _pause(page, 120)
 
-    # Must use three-dots menu at the right side of meeting card.
-    meeting_row = page.locator("div:has-text('Minute Meeting'), div:has-text('Meeting')").first
-    try:
-        meeting_row.wait_for(state="visible", timeout=4_000)
-        meeting_row.scroll_into_view_if_needed()
-        meeting_row.hover(timeout=2_000)
-    except Exception:  # noqa: BLE001
-        pass
-
     menu_clicked = False
-    # 1) Dedicated three dots near "Copy link".
-    try:
-        row_menu = meeting_row.locator("button[aria-haspopup='menu'], button[aria-label*='more' i]").last
-        row_menu.click(timeout=2_500)
-        menu_clicked = True
-    except Exception:  # noqa: BLE001
-        menu_clicked = False
+    # 1) Direct button by explicit tooltip/aria label.
+    menu_clicked = _click_first(
+        page,
+        [
+            "button[aria-label*='Meeting settings' i]",
+            "button[aria-label*='settings' i]",
+            "button[aria-haspopup='menu'][aria-label*='Minute' i]",
+        ],
+        timeout=2_000,
+    )
 
-    # 2) XPath fallback anchored to Copy link button.
+    # 2) XPath fallback anchored to Copy link button in event row.
     if not menu_clicked:
         menu_clicked = _click_first(
             page,
@@ -999,6 +1047,19 @@ def _open_event_editor_panel(page: Page) -> bool:
             ],
             timeout=3_000,
         )
+
+    # 3) Hover row then click last menu button in row.
+    if not menu_clicked:
+        meeting_row = page.locator("div:has-text('Minute Meeting'), div:has-text('Meeting')").first
+        try:
+            meeting_row.wait_for(state="visible", timeout=3_000)
+            meeting_row.scroll_into_view_if_needed()
+            meeting_row.hover(timeout=1_500)
+            row_menu = meeting_row.locator("button[aria-haspopup='menu'], button[aria-label*='more' i]").last
+            row_menu.click(timeout=2_000)
+            menu_clicked = True
+        except Exception:  # noqa: BLE001
+            menu_clicked = False
 
     if menu_clicked:
         if _click_first(
