@@ -460,7 +460,7 @@ def _load_cookies_if_present(context: BrowserContext, cookie_file: str) -> None:
         context.add_cookies(cookies)
 
 
-def _click_create_with_password(page: Page) -> None:
+def _click_create_with_password(page: Page) -> bool:
     # Direct robust click for "Prefer to create an account with a password? Click here"
     try:
         clicked = page.evaluate(
@@ -483,7 +483,7 @@ def _click_create_with_password(page: Page) -> None:
         )
         if clicked:
             _pause(page, 200)
-            return
+            return True
     except Exception:  # noqa: BLE001
         pass
 
@@ -496,8 +496,7 @@ def _click_create_with_password(page: Page) -> None:
         ],
         timeout=1_500,
     )
-    if not clicked:
-        raise CalendlyAutomationError("Could not switch signup flow to password mode.")
+    return clicked
 
 
 def _in_password_signup_mode(page: Page) -> bool:
@@ -526,9 +525,12 @@ def _fill_signup_form(page: Page, account_name: str, password: str, email: str) 
             _safe_click_next(page)
             _pause(page, 200)
         # Case 2: email already pre-filled page (as in your screenshot) - go directly via Click here.
-        if not _in_password_signup_mode(page):
+        deadline = time.time() + 8
+        while not _in_password_signup_mode(page) and time.time() < deadline:
             _click_create_with_password(page)
-            _pause(page, 250)
+            _pause(page, 150)
+        if not _in_password_signup_mode(page):
+            raise CalendlyAutomationError("Could not switch signup flow to password mode.")
 
     if not _fill_first(
         page,
@@ -677,6 +679,84 @@ def _choose_random_labels(page: Page, labels: list[str], min_clicks: int = 1, ma
             clicked += 1
             _pause(page, 60)
     return clicked
+
+
+def _force_pick_intro_team(page: Page) -> tuple[int, int]:
+    """JS fallback for /app/intro/team where normal clicks fail."""
+    try:
+        picked = page.evaluate(
+            """
+            () => {
+              const clickByText = (targets, maxClicks) => {
+                let clicks = 0;
+                for (const target of targets.sort(() => Math.random() - 0.5)) {
+                  if (clicks >= maxClicks) break;
+                  const nodes = Array.from(document.querySelectorAll('button, [role="button"], label, div, span'));
+                  const node = nodes.find((el) => {
+                    const txt = (el.innerText || el.textContent || '').toLowerCase();
+                    if (!txt.includes(target.toLowerCase())) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return rect.width > 20 && rect.height > 10 && style.display !== 'none' && style.visibility !== 'hidden';
+                  });
+                  if (node) {
+                    node.click();
+                    clicks += 1;
+                  }
+                }
+                return clicks;
+              };
+
+              const top = clickByText(['On my own', 'With my team'], 1);
+              const help = clickByText(
+                [
+                  'Meet with multiple attendees',
+                  'Schedule meetings',
+                  'Collect payment',
+                  'Automate pre/post meeting emails',
+                  'Record and transcribe meetings',
+                  'Manage contact records'
+                ],
+                2
+              );
+              return { top, help };
+            }
+            """
+        )
+        if isinstance(picked, dict):
+            return int(picked.get("top", 0)), int(picked.get("help", 0))
+    except Exception:  # noqa: BLE001
+        pass
+    return 0, 0
+
+
+def _force_pick_intro_role(page: Page) -> int:
+    try:
+        picked = page.evaluate(
+            """
+            () => {
+              const targets = ['Finance','Sales','Customer success','Recruiting','Marketing','Education','Consulting','Other'];
+              for (const target of targets.sort(() => Math.random() - 0.5)) {
+                const nodes = Array.from(document.querySelectorAll('button, [role="button"], label, div, span'));
+                const node = nodes.find((el) => {
+                  const txt = (el.innerText || el.textContent || '').toLowerCase();
+                  if (!txt.includes(target.toLowerCase())) return false;
+                  const rect = el.getBoundingClientRect();
+                  const style = window.getComputedStyle(el);
+                  return rect.width > 20 && rect.height > 10 && style.display !== 'none' && style.visibility !== 'hidden';
+                });
+                if (node) {
+                  node.click();
+                  return 1;
+                }
+              }
+              return 0;
+            }
+            """
+        )
+        return int(picked) if isinstance(picked, int) else 0
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 def _click_next_until_progress(page: Page, retries: int = 4) -> bool:
@@ -859,7 +939,12 @@ def _complete_onboarding(page: Page) -> None:
                 max_clicks=2,
             )
             if top_clicked == 0 or help_clicked == 0:
-                raise CalendlyAutomationError("Could not select onboarding options on /app/intro/team")
+                forced_top, forced_help = _force_pick_intro_team(page)
+                top_clicked += forced_top
+                help_clicked += forced_help
+                _progress(f"Team page fallback picks: top={forced_top}, help={forced_help}")
+            if top_clicked == 0 or help_clicked == 0:
+                _progress("Could not select all team options yet, trying Next anyway.")
             _click_next_until_progress(page, retries=5)
             continue
 
@@ -872,7 +957,9 @@ def _complete_onboarding(page: Page) -> None:
                 max_clicks=1,
             )
             if role_clicked == 0:
-                raise CalendlyAutomationError("Could not select role on onboarding page.")
+                role_clicked += _force_pick_intro_role(page)
+            if role_clicked == 0:
+                _progress("Could not select role yet, trying Next anyway.")
             _click_next_until_progress(page, retries=5)
             continue
 
