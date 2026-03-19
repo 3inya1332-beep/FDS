@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
@@ -30,29 +31,8 @@ class AdsApiClient:
         self.api_key = api_key.strip()
         self.timeout_seconds = timeout_seconds
 
-    def _headers(self) -> dict[str, str]:
-        headers = {"Accept": "application/json"}
-        if self.api_key and self.api_key != "PASTE_YOUR_ADS_API_KEY":
-            # Different ADS API builds may use one of these headers.
-            headers["Authorization"] = self.api_key
-            headers["X-API-KEY"] = self.api_key
-            headers["api-key"] = self.api_key
-        return headers
-
-    def _auth_params(self) -> dict[str, str]:
-        if not self.api_key or self.api_key == "PASTE_YOUR_ADS_API_KEY":
-            return {}
-        # Different ADS builds expect different query names.
-        return {
-            "api-key": self.api_key,
-            "api_key": self.api_key,
-        }
-
     def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
         url = f"{self.base_url}{path}"
-        params = kwargs.pop("params", None) or {}
-        params.update(self._auth_params())
-        kwargs["params"] = params
 
         retries = 4
         for attempt in range(retries):
@@ -72,13 +52,75 @@ class AdsApiClient:
             if "too many request per second" in msg and attempt < retries - 1:
                 # ADS local API has strict QPS limits.
                 backoff = 0.7 * (2**attempt)
-                import time
-
                 time.sleep(backoff)
                 continue
             return payload
 
         raise AdsApiError("ADS API request failed after retries")
+
+    @staticmethod
+    def _msg(payload: dict[str, Any]) -> str:
+        return str(payload.get("msg", "")).strip()
+
+    @staticmethod
+    def _requires_api_key(payload: dict[str, Any]) -> bool:
+        return "require api-key" in str(payload.get("msg", "")).lower()
+
+    def _auth_variants(self) -> list[tuple[dict[str, str], dict[str, str]]]:
+        if not self.api_key or self.api_key == "PASTE_YOUR_ADS_API_KEY":
+            return [({}, {})]
+        key = self.api_key
+        return [
+            ({"Accept": "application/json", "api-key": key}, {}),
+            ({"Accept": "application/json", "Api-Key": key}, {}),
+            ({"Accept": "application/json", "X-API-KEY": key}, {}),
+            ({"Accept": "application/json", "X-Api-Key": key}, {}),
+            ({"Accept": "application/json", "Authorization": key}, {}),
+            ({"Accept": "application/json", "Authorization": f"Bearer {key}"}, {}),
+            ({"Accept": "application/json"}, {"api-key": key}),
+            ({"Accept": "application/json"}, {"api_key": key}),
+            ({"Accept": "application/json"}, {"apikey": key}),
+            (
+                {
+                    "Accept": "application/json",
+                    "api-key": key,
+                    "Authorization": f"Bearer {key}",
+                },
+                {"api-key": key},
+            ),
+        ]
+
+    def _request_with_auth_fallback(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json_payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        base_params = dict(params or {})
+        errors: list[str] = []
+        for index, (headers, auth_params) in enumerate(self._auth_variants(), start=1):
+            merged_params = dict(base_params)
+            merged_params.update(auth_params)
+            kwargs: dict[str, Any] = {"params": merged_params, "headers": headers}
+            if json_payload is not None:
+                kwargs["json"] = json_payload
+            try:
+                payload = self._request(method, path, **kwargs)
+                if self._requires_api_key(payload):
+                    errors.append(f"auth_variant#{index}: {self._msg(payload)}")
+                    time.sleep(0.5)
+                    continue
+                return payload
+            except requests.HTTPError as exc:
+                errors.append(f"auth_variant#{index}: HTTP {exc}")
+                time.sleep(0.5)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"auth_variant#{index}: {exc}")
+                time.sleep(0.5)
+
+        raise AdsApiError("Auth fallback exhausted. " + " | ".join(errors))
 
     @staticmethod
     def _extract_cdp_url(data: dict[str, Any]) -> str | None:
@@ -137,40 +179,27 @@ class AdsApiClient:
             (
                 "GET",
                 "/api/v1/browser/start",
-                {"params": {"user_id": profile_id, "headless": int(headless), "open_tabs": open_tabs}},
+                {"params": {"user_id": profile_id}},
             ),
             (
                 "GET",
                 "/api/v1/browser/start",
-                {"params": {"profile_id": profile_id, "headless": int(headless), "open_tabs": open_tabs}},
-            ),
-            (
-                "POST",
-                "/api/v1/browser/start",
-                {"json": {"user_id": profile_id, "headless": int(headless), "open_tabs": open_tabs}},
-            ),
-            (
-                "POST",
-                "/api/v1/browser/start",
-                {"json": {"profile_id": profile_id, "headless": int(headless), "open_tabs": open_tabs}},
+                {"params": {"profile_id": profile_id}},
             ),
         ]
 
         errors: list[str] = []
         for method, path, kwargs in payload_variants:
             try:
-                response_payload = self._request(method, path, **kwargs)
-                message = str(response_payload.get("msg", "")).lower()
-                if "require api-key" in message:
-                    raise AdsApiError(
-                        "ADS API returned 'Require api-key'. "
-                        "Set valid API_KEY in config.py and ensure local API accepts it."
-                    )
+                response_payload = self._request_with_auth_fallback(
+                    method=method,
+                    path=path,
+                    params=kwargs.get("params"),
+                    json_payload=kwargs.get("json"),
+                )
                 if not self._is_success(response_payload):
                     errors.append(str(response_payload))
                     # Avoid hitting ADS rate limits while trying fallback payloads.
-                    import time
-
                     time.sleep(0.7)
                     continue
                 data = self._data_from_payload(response_payload)
@@ -178,13 +207,9 @@ class AdsApiClient:
                 if cdp_url:
                     return AdsBrowserSession(profile_id=profile_id, cdp_url=cdp_url)
                 errors.append(f"CDP endpoint not found in payload: {response_payload}")
-                import time
-
                 time.sleep(0.7)
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"{method} {path} failed: {exc}")
-                import time
-
                 time.sleep(0.7)
 
         raise AdsApiError("Unable to start ADS browser profile. " + " | ".join(errors))
@@ -194,12 +219,15 @@ class AdsApiClient:
         stop_variants = [
             ("GET", "/api/v1/browser/stop", {"params": {"user_id": profile_id}}),
             ("GET", "/api/v1/browser/stop", {"params": {"profile_id": profile_id}}),
-            ("POST", "/api/v1/browser/stop", {"json": {"user_id": profile_id}}),
-            ("POST", "/api/v1/browser/stop", {"json": {"profile_id": profile_id}}),
         ]
         for method, path, kwargs in stop_variants:
             try:
-                self._request(method, path, **kwargs)
+                self._request_with_auth_fallback(
+                    method=method,
+                    path=path,
+                    params=kwargs.get("params"),
+                    json_payload=kwargs.get("json"),
+                )
                 return
             except Exception:  # noqa: BLE001
                 continue
