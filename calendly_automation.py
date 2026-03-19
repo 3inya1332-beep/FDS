@@ -182,6 +182,31 @@ def _wait_for_ads_profile_ready(context: BrowserContext, page: Page) -> None:
     raise CalendlyAutomationError(f"ADS profile did not become ready in time: {last_error}")
 
 
+def _safe_goto_calendly(page: Page, url: str, *, timeout_ms: int = 45_000) -> None:
+    """
+    Navigate to Calendly URL with tolerant fallback for transient proxy/socket failures.
+    """
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+        return
+    except Exception as first_exc:  # noqa: BLE001
+        message = str(first_exc)
+        _progress(f"Navigation warning for {url}: {message}")
+
+    # Faster fallback, less strict load state.
+    try:
+        page.goto(url, wait_until="commit", timeout=max(15_000, timeout_ms // 2))
+        return
+    except Exception as second_exc:  # noqa: BLE001
+        message = str(second_exc)
+        _progress(f"Navigation fallback warning for {url}: {message}")
+        # If we're already on Calendly domain, continue flow instead of hard fail.
+        if "calendly.com" in page.url:
+            _progress(f"Continuing on current Calendly page: {page.url}")
+            return
+        raise CalendlyAutomationError(f"Failed to open page {url}: {second_exc}") from second_exc
+
+
 def _resolve_or_create_dir(candidates: list[Path]) -> Path:
     for folder in candidates:
         if folder.exists():
@@ -309,10 +334,6 @@ def open_ads_page(ads_profile_id: str) -> Iterable[tuple[Page, BrowserContext]]:
             page.set_default_timeout(8_000)
             page.set_default_navigation_timeout(45_000)
             page.bring_to_front()
-            try:
-                page.goto("about:blank", wait_until="domcontentloaded", timeout=20_000)
-            except Exception:  # noqa: BLE001
-                pass
             _maximize_ads_window(browser, page)
             _wait_for_ads_profile_ready(context, page)
             yield page, context
@@ -534,35 +555,14 @@ def _signup_page_has_interactive_controls(page: Page) -> bool:
 
 def _open_signup_page_with_recovery(page: Page) -> None:
     _progress(f"Opening signup page: {CALENDLY_SIGNUP_URL}")
-    load_error: Exception | None = None
-    for attempt in range(1, SIGNUP_LOAD_MAX_RELOADS + 1):
-        try:
-            if attempt == 1:
-                page.goto(CALENDLY_SIGNUP_URL, wait_until="domcontentloaded", timeout=45_000)
-            else:
-                refreshed_url = f"{CALENDLY_SIGNUP_URL}?r={int(time.time() * 1000)}"
-                page.goto(refreshed_url, wait_until="domcontentloaded", timeout=45_000)
-            _pause(page, 120)
-        except Exception as exc:  # noqa: BLE001
-            load_error = exc
-            _progress(f"Signup open attempt {attempt} navigation error: {exc}")
-
-        start = time.time()
-        while time.time() - start < SIGNUP_LOAD_CHECK_TIMEOUT_SECONDS:
-            if _signup_page_has_interactive_controls(page):
-                _progress(f"Signup page ready after attempt {attempt}.")
-                return
-            _pause(page, 80)
-
-        _progress(f"Signup not fully loaded on attempt {attempt}, refreshing.")
-        try:
-            page.reload(wait_until="domcontentloaded", timeout=30_000)
-        except Exception as exc:  # noqa: BLE001
-            load_error = exc
-
-    raise CalendlyAutomationError(
-        f"Signup page did not fully load after {SIGNUP_LOAD_MAX_RELOADS} attempts: {load_error}"
-    )
+    _safe_goto_calendly(page, CALENDLY_SIGNUP_URL, timeout_ms=45_000)
+    start = time.time()
+    while time.time() - start < SIGNUP_LOAD_CHECK_TIMEOUT_SECONDS:
+        if _signup_page_has_interactive_controls(page):
+            _progress("Signup page ready.")
+            return
+        _pause(page, 80)
+    raise CalendlyAutomationError("Signup page did not become interactive in time.")
 
 
 def _fill_signup_form(page: Page, account_name: str, password: str, email: str) -> None:
@@ -628,7 +628,7 @@ def _fill_signup_form(page: Page, account_name: str, password: str, email: str) 
 
 
 def _finish_email_confirmation(page: Page, confirmation_url: str, password: str) -> None:
-    page.goto(confirmation_url, wait_until="domcontentloaded", timeout=90_000)
+    _safe_goto_calendly(page, confirmation_url, timeout_ms=90_000)
     _pause(page, 500)
 
     # If sign-in page appears, fill password and continue.
@@ -1282,7 +1282,7 @@ def configure_account_notifications(profile: Profile) -> str:
 
     with open_ads_page(profile.ads_profile_id) as (page, context):
         _load_cookies_if_present(context, profile.cookie_file)
-        page.goto(profile.main_page_url or CALENDLY_MEETING_TYPES_URL, wait_until="domcontentloaded", timeout=90_000)
+        _safe_goto_calendly(page, profile.main_page_url or CALENDLY_MEETING_TYPES_URL, timeout_ms=60_000)
         _pause(page, 250)
 
         if not _open_event_editor_panel(page):
