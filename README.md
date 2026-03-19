@@ -1,31 +1,24 @@
-# ADS Browser + pCloud inviter
-
-Скрипт автоматизирует работу с `https://my.pcloud.com/` через **ADS Browser API**:
-
-1. Запускает профиль ADS Browser по `profile_id`.
-2. Открывает `my.pcloud.com`.
-3. Создает папку (имя берется из `edit/NAME.txt`).
-4. Открывает `Invite to folder` для этой папки.
-5. Вставляет email-адреса батчами по 20 (каждый email подтверждается `Enter`).
-6. Вставляет сообщение из `edit/text.txt`.
-7. Нажимает `Share`.
-8. Повторяет, пока email не закончатся.
+# ADS Browser + Calendly automation
 
 ## Структура
 
 - `main.py` — консольное меню запуска.
-- `config.py` — настройки ADS API и поведения скрипта.
+- `config.py` — настройки ADS API, AnyMessage API, 9proxy и путей.
 - `ads_api.py` — запросы к локальному ADS API.
+- `anymessage_api.py` — покупка email и ожидание письма подтверждения.
+- `proxy_manager.py` — смена прокси через 9proxy API (только на ошибках).
+- `calendly_automation.py` — сценарии регистрации/настройки/бронирования в Calendly.
 - `profile_store.py` — база профилей (`sqlite`).
-- `pcloud_automation.py` — действия в интерфейсе pCloud через Playwright.
-- `edit/NAME.txt` — имя создаваемой папки.
-- `edit/text.txt` — текст сообщения для инвайта.
+- `edit/subject.txt` — шаблон Subject для Email confirmation.
+- `edit/body.txt` — шаблон Body для Email confirmation.
 - `email/emails.txt` — список email (по одному в строке).
+- `coockie/` — сохраненные cookies профилей.
 
 ## Установка
 
 ```bash
 pip install -r requirements.txt
+playwright install chromium
 ```
 
 ## Настройка
@@ -34,7 +27,8 @@ pip install -r requirements.txt
 
 - `LOCAL_API_BASE` (обычно `http://127.0.0.1:50325`)
 - `API_KEY` (если используется вашей версией ADS)
-- при необходимости `ADS_HEADLESS`, `BATCH_SIZE`, `BATCH_DELAY_SECONDS`
+- `ANYMESSAGE_TOKEN` и параметры домена/site
+- параметры `NINEPROXY_*` (если нужна аварийная смена proxy)
 
 ## Запуск
 
@@ -44,11 +38,14 @@ python main.py
 
 В меню:
 
-1. Добавьте профиль ADS (введите `ADS profile id` и URL).
-2. Выберите запуск автоматизации.
+1. Регистрация аккаунта Calendly через ADS + AnyMessage.
+2. Ручное добавление профиля.
+3. Привязка ссылок (`meeting_types` и `copy link`).
+4. Настройка шаблонов `Email confirmation`.
+5. Цикл `Schedule Event` по email-списку.
 
 ## Важно
 
-- Скрипт использует **запросы к ADS API** и DOM-автоматизацию (без координат/скрин-кликов).
-- Перед запуском профиль ADS должен быть уже готов (авторизация в pCloud выполнена).
-- Если в `email/` есть другой `.txt`, скрипт сможет взять его, если `emails.txt` отсутствует.
+- Скрипт использует запросы к ADS API и UI-автоматизацию через Playwright CDP.
+- Cookies сохраняются в папку `coockie` после регистрации/настройки/отправки.
+- Смена proxy не делается после каждого батча, только при ошибках регистрации.

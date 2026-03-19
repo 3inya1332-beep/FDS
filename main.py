@@ -4,14 +4,21 @@ import sqlite3
 from typing import Iterable
 
 from ads_api import AdsApiError
-from config import DEFAULT_PCLOUD_URL
-from pcloud_automation import PcloudAutomationError, ensure_input_files, run_job
+from calendly_automation import (
+    CalendlyAutomationError,
+    NoAvailableSlotError,
+    configure_account_notifications,
+    ensure_input_files,
+    register_calendly_account,
+    run_booking_sender,
+)
+from config import CALENDLY_MEETING_TYPES_URL
 from profile_store import Profile, ProfileStore
 
 
 def print_header() -> None:
     print("\n" + "=" * 60)
-    print("                 ADS + pCloud AUTO INVITER")
+    print("              ADS + Calendly Automation CLI")
     print("=" * 60)
 
 
@@ -23,7 +30,8 @@ def print_profiles(profiles: Iterable[Profile]) -> None:
     print("\nСохраненные ADS профили:")
     for profile in profiles:
         print(
-            f"  [{profile.local_id}] {profile.name} | ADS ID: {profile.ads_profile_id} | URL: {profile.start_url}"
+            f"  [{profile.local_id}] {profile.name} | ADS ID: {profile.ads_profile_id} | "
+            f"Email: {profile.login_email or '-'} | booking: {profile.booking_url or '-'} | status: {profile.status}"
         )
 
 
@@ -38,19 +46,145 @@ def ask_int(prompt: str) -> int | None:
 
 
 def add_profile_flow(store: ProfileStore) -> None:
-    print("\nДобавление ADS профиля")
+    print("\nРучное добавление ADS профиля")
     name = input("Название профиля (любое): ").strip()
     ads_profile_id = input("ADS profile id: ").strip()
-    start_url = input(f"URL старта [{DEFAULT_PCLOUD_URL}]: ").strip() or DEFAULT_PCLOUD_URL
+    login_email = input("Логин email (если есть): ").strip()
+    password = input("Пароль (если есть): ").strip()
+    main_page_url = input(f"Main page URL [{CALENDLY_MEETING_TYPES_URL}]: ").strip() or CALENDLY_MEETING_TYPES_URL
+    booking_url = input("Booking page URL (copy link): ").strip()
 
     if not name or not ads_profile_id:
         print("Название и ADS profile id обязательны.")
         return
     try:
-        store.add_profile(name=name, ads_profile_id=ads_profile_id, start_url=start_url)
+        store.add_profile(
+            name=name,
+            ads_profile_id=ads_profile_id,
+            login_email=login_email,
+            password=password,
+            main_page_url=main_page_url,
+            booking_url=booking_url,
+            status="manual",
+        )
         print("Профиль добавлен.")
     except sqlite3.IntegrityError:
         print("Такой ADS profile id уже существует в базе.")
+
+
+def register_account_flow(store: ProfileStore) -> None:
+    print("\nРегистрация нового аккаунта Calendly")
+    account_name = input("Введите Full name (например Depop Support): ").strip()
+    ads_profile_id = input("ADS profile id для регистрации: ").strip()
+    if not account_name or not ads_profile_id:
+        print("Имя аккаунта и ADS profile id обязательны.")
+        return
+
+    print("\nЗапускаю регистрацию через ADS + AnyMessage API ...")
+    result = register_calendly_account(account_name=account_name, ads_profile_id=ads_profile_id)
+    try:
+        store.add_profile(
+            name=result.account_name,
+            ads_profile_id=ads_profile_id,
+            login_email=result.login_email,
+            password=result.password,
+            main_page_url=result.main_page_url,
+            cookie_file=result.cookie_file,
+            anymessage_activation_id=result.activation_id,
+            status="registered",
+        )
+    except sqlite3.IntegrityError:
+        existing = [profile for profile in store.list_profiles() if profile.ads_profile_id == ads_profile_id]
+        if existing:
+            store.update_profile(
+                existing[0].local_id,
+                name=result.account_name,
+                login_email=result.login_email,
+                password=result.password,
+                main_page_url=result.main_page_url,
+                cookie_file=result.cookie_file,
+                anymessage_activation_id=result.activation_id,
+                status="registered",
+            )
+
+    print("Готово. Аккаунт зарегистрирован и сохранен:")
+    print(f"  Email: {result.login_email}")
+    print(f"  Password: {result.password}")
+    print(f"  Cookie file: {result.cookie_file}")
+
+
+def select_profile_flow(store: ProfileStore) -> Profile | None:
+    profiles = list(store.list_profiles())
+    print_profiles(profiles)
+    if not profiles:
+        return None
+    selected = ask_int("Введите локальный ID профиля: ")
+    if selected is None:
+        return None
+    profile = store.get_profile(selected)
+    if profile is None:
+        print("Профиль не найден.")
+        return None
+    return profile
+
+
+def update_links_flow(store: ProfileStore) -> None:
+    print("\nОбновить ссылки аккаунта")
+    profile = select_profile_flow(store)
+    if profile is None:
+        return
+
+    main_page_url = input(
+        f"Ссылка на главную страницу [{profile.main_page_url or CALENDLY_MEETING_TYPES_URL}]: "
+    ).strip() or profile.main_page_url or CALENDLY_MEETING_TYPES_URL
+    booking_url = input(f"Ссылка на страницу отправки (copy link) [{profile.booking_url or '-'}]: ").strip()
+    if not booking_url:
+        booking_url = profile.booking_url
+
+    ads_profile_id = input(f"ADS profile id [{profile.ads_profile_id}]: ").strip() or profile.ads_profile_id
+    updated = store.update_profile(
+        profile.local_id,
+        main_page_url=main_page_url,
+        booking_url=booking_url,
+        ads_profile_id=ads_profile_id,
+        status="ready",
+    )
+    print("Профиль обновлен." if updated else "Не удалось обновить профиль.")
+
+
+def setup_account_flow(store: ProfileStore) -> None:
+    print("\nНастройка аккаунта (subject/body)")
+    profile = select_profile_flow(store)
+    if profile is None:
+        return
+
+    cookie_file = configure_account_notifications(profile)
+    store.update_profile(profile.local_id, cookie_file=cookie_file, status="configured")
+    print("Настройка завершена. Шаблоны подтверждения обновлены.")
+
+
+def run_sender_flow(store: ProfileStore) -> None:
+    print("\nНачало отправки бронирований")
+    profile = select_profile_flow(store)
+    if profile is None:
+        return
+
+    date_page_url = input("Вставьте ссылку страницы с датой (можно пусто): ").strip()
+    fallback_booking_url = input(
+        f"Ссылка booking (если нет времени на дате) [{profile.booking_url or '-'}]: "
+    ).strip()
+    if not fallback_booking_url:
+        fallback_booking_url = profile.booking_url
+
+    stats = run_booking_sender(
+        profile,
+        date_page_url=date_page_url,
+        fallback_booking_url=fallback_booking_url,
+    )
+    print("\nОтправка завершена:")
+    print(f"  Запланировано событий: {stats.scheduled_events}")
+    print(f"  Израсходовано email: {stats.consumed_emails}")
+    print(f"  Осталось email: {stats.remaining_emails}")
 
 
 def delete_profile_flow(store: ProfileStore) -> None:
@@ -67,55 +201,37 @@ def delete_profile_flow(store: ProfileStore) -> None:
         print("Профиль не найден.")
 
 
-def run_flow(store: ProfileStore) -> None:
-    profiles = list(store.list_profiles())
-    print_profiles(profiles)
-    if not profiles:
-        print("Сначала добавьте профиль.")
-        return
-
-    selected = ask_int("Введите локальный ID профиля для запуска: ")
-    if selected is None:
-        return
-
-    profile = store.get_profile(selected)
-    if profile is None:
-        print("Профиль не найден.")
-        return
-
-    print("\nЗапускаю автоматизацию...")
-    try:
-        stats = run_job(profile)
-        print("\nГотово:")
-        print(f"  Всего email: {stats.total_emails}")
-        print(f"  Отправлено: {stats.sent_emails}")
-        print(f"  Ошибочных батчей: {stats.failed_batches}")
-    except (AdsApiError, PcloudAutomationError) as exc:
-        print(f"Ошибка запуска: {exc}")
-
-
 def show_menu() -> None:
     store = ProfileStore()
     ensure_input_files()
 
     while True:
         print_header()
-        print("1. Добавить профиль ADS Browser")
-        print("2. Показать профили")
-        print("3. Удалить профиль")
-        print("4. Запустить создание folder + invite emails")
-        print("5. Выход")
+        print("1. Регистрация аккаунта Calendly")
+        print("2. Добавить профиль ADS Browser вручную")
+        print("3. Добавить/обновить ссылки профиля")
+        print("4. Настройка аккаунта (subject/body)")
+        print("5. Начало отправки (Schedule Event loop)")
+        print("6. Показать профили")
+        print("7. Удалить профиль")
+        print("8. Выход")
         choice = input("\nВыберите действие: ").strip()
 
         if choice == "1":
-            add_profile_flow(store)
+            register_account_flow(store)
         elif choice == "2":
-            print_profiles(store.list_profiles())
+            add_profile_flow(store)
         elif choice == "3":
-            delete_profile_flow(store)
+            update_links_flow(store)
         elif choice == "4":
-            run_flow(store)
+            setup_account_flow(store)
         elif choice == "5":
+            run_sender_flow(store)
+        elif choice == "6":
+            print_profiles(store.list_profiles())
+        elif choice == "7":
+            delete_profile_flow(store)
+        elif choice == "8":
             print("Выход.")
             break
         else:
@@ -125,4 +241,7 @@ def show_menu() -> None:
 
 
 if __name__ == "__main__":
-    show_menu()
+    try:
+        show_menu()
+    except (AdsApiError, CalendlyAutomationError, NoAvailableSlotError) as exc:
+        print(f"\nКритическая ошибка: {exc}")
