@@ -33,6 +33,8 @@ class AdsApiClient:
 
     def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
         url = f"{self.base_url}{path}"
+        headers = dict(kwargs.pop("headers", {}) or {})
+        headers.setdefault("Accept", "application/json")
 
         retries = 4
         for attempt in range(retries):
@@ -40,9 +42,14 @@ class AdsApiClient:
                 method=method.upper(),
                 url=url,
                 timeout=self.timeout_seconds,
-                headers=self._headers(),
+                headers=headers,
                 **kwargs,
             )
+            if response.status_code == 429 and attempt < retries - 1:
+                # HTTP-level rate limit.
+                backoff = 0.7 * (2**attempt)
+                time.sleep(backoff)
+                continue
             response.raise_for_status()
             payload = response.json()
             if not isinstance(payload, dict):
