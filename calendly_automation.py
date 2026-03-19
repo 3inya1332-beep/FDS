@@ -346,7 +346,6 @@ def open_ads_page(ads_profile_id: str) -> Iterable[tuple[Page, BrowserContext]]:
             _maximize_ads_window(browser, page)
             _wait_for_ads_profile_ready(context, page)
             yield page, context
-            browser.close()
     finally:
         ads_client.stop_browser(session.profile_id)
         _progress(f"ADS profile {ads_profile_id} stopped")
@@ -1422,54 +1421,62 @@ def _is_booking_form_visible(page: Page) -> bool:
 
 
 def _click_first_time_button(page: Page) -> bool:
-    selectors = [
-        "button[aria-label*='time' i]",
-        "button:has-text('am')",
-        "button:has-text('pm')",
-    ]
-    for selector in selectors:
-        buttons = page.locator(selector)
-        count = buttons.count()
-        for idx in range(min(count, 20)):
-            btn = buttons.nth(idx)
-            try:
-                if not btn.is_visible():
-                    continue
-                if not btn.is_enabled():
-                    continue
-                txt = (btn.text_content() or "").strip().lower()
-                if not txt:
-                    continue
-                if ":" not in txt and "am" not in txt and "pm" not in txt:
-                    continue
-                btn.click(timeout=1_500)
-                _pause(page, 120)
-                _click_first(page, ["button:has-text('Next')", "button:has-text('Confirm')"], timeout=1_500)
-                return True
-            except Exception:  # noqa: BLE001
-                continue
+    try:
+        clicked = page.evaluate(
+            """
+            () => {
+              const buttons = Array.from(document.querySelectorAll('button'));
+              const regex = /^\\d{1,2}:\\d{2}\\s?(am|pm)$/i;
+              for (const btn of buttons) {
+                const txt = (btn.textContent || '').trim();
+                if (!regex.test(txt)) continue;
+                if (btn.disabled || btn.getAttribute('aria-disabled') === 'true') continue;
+                const r = btn.getBoundingClientRect();
+                const s = window.getComputedStyle(btn);
+                if (r.width < 40 || r.height < 20) continue;
+                if (s.display === 'none' || s.visibility === 'hidden') continue;
+                btn.click();
+                return true;
+              }
+              return false;
+            }
+            """
+        )
+        if clicked:
+            _pause(page, 100)
+            _click_first(page, ["button:has-text('Next')", "button:has-text('Confirm')"], timeout=1_200)
+            return True
+    except Exception:  # noqa: BLE001
+        pass
     return False
 
 
 def _click_first_available_date(page: Page) -> bool:
-    date_selectors = [
-        "button[aria-label*='available' i]",
-        "button[data-testid*='calendar-day']",
-        "button[aria-label*='Choose' i]",
-    ]
-    for selector in date_selectors:
-        buttons = page.locator(selector)
-        count = buttons.count()
-        for idx in range(min(count, 62)):
-            btn = buttons.nth(idx)
-            try:
-                if not btn.is_visible() or not btn.is_enabled():
-                    continue
-                btn.click(timeout=1_500)
-                _pause(page, 120)
-                return True
-            except Exception:  # noqa: BLE001
-                continue
+    try:
+        clicked = page.evaluate(
+            """
+            () => {
+              const buttons = Array.from(document.querySelectorAll('button'));
+              for (const btn of buttons) {
+                const txt = (btn.textContent || '').trim();
+                if (!/^\\d{1,2}$/.test(txt)) continue; // only day circles
+                if (btn.disabled || btn.getAttribute('aria-disabled') === 'true') continue;
+                const r = btn.getBoundingClientRect();
+                const s = window.getComputedStyle(btn);
+                if (r.width < 18 || r.height < 18) continue;
+                if (s.display === 'none' || s.visibility === 'hidden') continue;
+                btn.click();
+                return true;
+              }
+              return false;
+            }
+            """
+        )
+        if clicked:
+            _pause(page, 100)
+            return True
+    except Exception:  # noqa: BLE001
+        pass
     return False
 
 
@@ -1540,17 +1547,39 @@ def _fill_booking_form(page: Page, invitee_name: str, invitee_email: str, guest_
         raise CalendlyAutomationError("Invitee Email input not found.")
 
     if guest_emails:
-        guest_value = ", ".join(guest_emails)
-        _fill_first(
+        _click_first(
             page,
             [
-                "textarea[name*='guest' i]",
-                "input[name*='guest' i]",
-                "textarea[aria-label*='Guest' i]",
+                "button:has-text('Add Guests')",
+                "button:has-text('Add guests')",
+                "text=Add Guests",
             ],
-            guest_value,
-            timeout=8_000,
+            timeout=1_500,
         )
+        guest_input = None
+        for selector in [
+            "input[name*='guest' i]",
+            "textarea[name*='guest' i]",
+            "input[aria-label*='Guest' i]",
+            "textarea[aria-label*='Guest' i]",
+        ]:
+            candidate = page.locator(selector).first
+            try:
+                if candidate.count() > 0 and candidate.is_visible():
+                    guest_input = candidate
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+
+        if guest_input is not None:
+            for guest in guest_emails:
+                try:
+                    guest_input.click(timeout=1_500)
+                    guest_input.fill(guest)
+                    guest_input.press("Enter")
+                    _pause(page, 40)
+                except Exception:  # noqa: BLE001
+                    continue
 
     if not _click_first(
         page,
@@ -1594,7 +1623,9 @@ def run_booking_sender(
             _progress(f"Opening booking page: {target_booking_url}")
             _safe_goto_calendly(page, target_booking_url, timeout_ms=60_000)
             _pause(page, 250)
+            _dismiss_cookie_banner(page)
 
+            _progress("Selecting first available date and time.")
             if not _select_first_available_time(page):
                 _progress("No available slots found now. Sender stopped without error.")
                 break

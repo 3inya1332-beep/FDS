@@ -7,7 +7,6 @@ from ads_api import AdsApiError
 from calendly_automation import (
     CalendlyAutomationError,
     NoAvailableSlotError,
-    configure_account_notifications,
     ensure_input_files,
     register_calendly_account,
     run_booking_sender,
@@ -153,14 +152,8 @@ def update_links_flow(store: ProfileStore) -> None:
 
 
 def setup_account_flow(store: ProfileStore) -> None:
-    print("\nНастройка аккаунта (subject/body)")
-    profile = select_profile_flow(store)
-    if profile is None:
-        return
-
-    cookie_file = configure_account_notifications(profile)
-    store.update_profile(profile.local_id, cookie_file=cookie_file, status="configured")
-    print("Настройка завершена. Шаблоны подтверждения обновлены.")
+    print("\nНастройка аккаунта временно недоступна.")
+    print("Функция будет включена позже.")
 
 
 def run_sender_flow(store: ProfileStore) -> None:
@@ -206,7 +199,7 @@ def show_menu() -> None:
         print("1. Регистрация аккаунта Calendly")
         print("2. Добавить профиль ADS Browser вручную")
         print("3. Добавить/обновить ссылки профиля")
-        print("4. Настройка аккаунта (subject/body)")
+        print("4. Настройка аккаунта (временно недоступно)")
         print("5. Начало отправки (Schedule Event loop)")
         print("6. Показать профили")
         print("7. Удалить профиль")
