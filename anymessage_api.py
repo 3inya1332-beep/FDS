@@ -188,3 +188,15 @@ class AnyMessageClient:
         raise AnyMessageApiError(
             f"Confirmation link not found for activation id={activation_id} in {timeout_seconds}s."
         )
+
+    def find_confirmation_link(self, activation_id: str) -> str | None:
+        payload = self.get_message(activation_id, preview=True)
+        message = html.unescape(self._extract_message_text(payload))
+        match = re.search(
+            r"https://calendly\.com/users/confirmation\?confirmation_token=[A-Za-z0-9._\-]+",
+            message,
+            flags=re.I,
+        )
+        if match:
+            return match.group(0)
+        return None

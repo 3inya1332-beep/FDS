@@ -26,6 +26,9 @@ from anymessage_api import AnyMessageApiError, AnyMessageClient
 from config import (
     ADS_HEADLESS,
     ADS_OPEN_TABS,
+    ACTION_SPEED_MULTIPLIER,
+    ANYMESSAGE_MAX_WAIT_SECONDS,
+    ANYMESSAGE_POLL_SECONDS,
     BODY_FILENAME,
     BOOKING_GUESTS_PER_EVENT,
     BOOKING_NAME_PREFIX,
@@ -79,6 +82,15 @@ class SendStats:
 def _progress(message: str) -> None:
     print(f"[INFO] {message}", flush=True)
     _write_log(message)
+
+
+def _scaled_ms(milliseconds: int) -> int:
+    factor = ACTION_SPEED_MULTIPLIER if ACTION_SPEED_MULTIPLIER > 0 else 1.0
+    return max(int(milliseconds * factor), 1)
+
+
+def _pause(page: Page, milliseconds: int) -> None:
+    page.wait_for_timeout(_scaled_ms(milliseconds))
 
 
 def _resolve_or_create_dir(candidates: list[Path]) -> Path:
@@ -243,14 +255,20 @@ def _fill_first(page: Page, selectors: list[str], value: str, timeout: int = 5_0
 
 
 def _wait_for_possible_captcha(page: Page) -> None:
-    captcha_selectors = [
-        "iframe[src*='captcha']",
+    recaptcha_selectors = [
+        "iframe[src*='google.com/recaptcha']",
         "iframe[src*='recaptcha']",
-        "iframe[src*='hcaptcha']",
-        "iframe[title*='captcha' i]",
-        "text=/verify.*human/i",
+        "div.g-recaptcha",
+        "textarea[name='g-recaptcha-response']",
         "text=/i am not a robot/i",
     ]
+    other_captcha_selectors = [
+        "iframe[src*='captcha']",
+        "iframe[src*='hcaptcha']",
+        "iframe[title*='hcaptcha' i]",
+        "text=/verify.*human/i",
+    ]
+    captcha_selectors = recaptcha_selectors + other_captcha_selectors
 
     def captcha_is_visible() -> bool:
         for selector in captcha_selectors:
@@ -265,7 +283,17 @@ def _wait_for_possible_captcha(page: Page) -> None:
     if not captcha_is_visible():
         return
 
-    _progress("Captcha detected on page.")
+    is_recaptcha = False
+    for selector in recaptcha_selectors:
+        locator = page.locator(selector).first
+        try:
+            if locator.count() > 0 and locator.is_visible():
+                is_recaptcha = True
+                break
+        except Exception:  # noqa: BLE001
+            continue
+
+    _progress("reCAPTCHA detected on page." if is_recaptcha else "Captcha detected on page.")
     mode = (CAPTCHA_MODE or "manual").strip().lower()
     if mode == "manual":
         _progress(
@@ -281,13 +309,13 @@ def _wait_for_possible_captcha(page: Page) -> None:
                     )
                 else:
                     # Non-interactive terminal fallback.
-                    page.wait_for_timeout(8_000)
+                    _pause(page, 4_000)
             except EOFError:
-                page.wait_for_timeout(8_000)
+                _pause(page, 4_000)
 
             # Try to continue flow in case submit is still pending.
             _safe_click_next(page)
-            page.wait_for_timeout(1_500)
+            _pause(page, 700)
 
             if not captcha_is_visible():
                 _progress("Captcha solved, continuing registration.")
@@ -303,7 +331,7 @@ def _wait_for_possible_captcha(page: Page) -> None:
         raise CaptchaSolveError("Captcha manual timeout exceeded.")
 
     _progress("Auto captcha wait mode: waiting before re-check.")
-    page.wait_for_timeout(CAPTCHA_WAIT_SECONDS * 1_000)
+    _pause(page, CAPTCHA_WAIT_SECONDS * 1_000)
     if captcha_is_visible():
         raise CaptchaSolveError("Captcha still present after auto wait.")
 
@@ -369,7 +397,7 @@ def _fill_signup_form(page: Page, account_name: str, password: str, email: str) 
 
     # On initial signup page email often triggers next state automatically.
     _safe_click_next(page)
-    page.wait_for_timeout(1_000)
+    _pause(page, 400)
 
     _click_create_with_password(page)
 
@@ -412,7 +440,7 @@ def _fill_signup_form(page: Page, account_name: str, password: str, email: str) 
 
 def _finish_email_confirmation(page: Page, confirmation_url: str, password: str) -> None:
     page.goto(confirmation_url, wait_until="domcontentloaded", timeout=90_000)
-    page.wait_for_timeout(1_200)
+    _pause(page, 500)
 
     # If sign-in page appears, fill password and continue.
     _fill_first(
@@ -470,7 +498,7 @@ def _configure_weekly_hours(page: Page) -> None:
 
 
 def _complete_onboarding(page: Page) -> None:
-    page.wait_for_timeout(2_000)
+    _pause(page, 800)
 
     _choose_random_option(page, ["On my own", "With my team"])
     _choose_random_option(
@@ -485,33 +513,66 @@ def _complete_onboarding(page: Page) -> None:
         ],
     )
     _safe_click_next(page)
-    page.wait_for_timeout(1_200)
+    _pause(page, 500)
 
     _choose_random_option(
         page,
         ["Finance", "Sales", "Customer success", "Recruiting", "Marketing", "Education", "Consulting", "Other"],
     )
     _safe_click_next(page)
-    page.wait_for_timeout(1_200)
+    _pause(page, 500)
 
     # Calendar connection page: click Next, if redirected to Google auth - go back.
     _safe_click_next(page)
-    page.wait_for_timeout(2_000)
+    _pause(page, 700)
     if "accounts.google.com" in page.url:
         page.go_back(wait_until="domcontentloaded")
-        page.wait_for_timeout(1_000)
+        _pause(page, 400)
         _safe_click_next(page)
 
-    page.wait_for_timeout(1_500)
+    _pause(page, 700)
     _configure_weekly_hours(page)
     _safe_click_next(page)
-    page.wait_for_timeout(1_000)
+    _pause(page, 400)
     _safe_click_next(page)
 
     try:
         page.wait_for_url("**/app/scheduling/meeting_types/**", timeout=90_000)
     except Exception:  # noqa: BLE001
         page.goto(CALENDLY_MEETING_TYPES_URL, wait_until="domcontentloaded", timeout=90_000)
+
+
+def _wait_confirmation_with_captcha_support(
+    page: Page,
+    anymessage: AnyMessageClient,
+    activation_id: str,
+) -> str:
+    _progress("Waiting for confirmation email link from AnyMessage")
+    deadline = time.time() + ANYMESSAGE_MAX_WAIT_SECONDS
+    poll_seconds = max(1, int(ANYMESSAGE_POLL_SECONDS * ACTION_SPEED_MULTIPLIER))
+
+    while time.time() < deadline:
+        # Keep page open and allow manual captcha solve before polling mail.
+        _wait_for_possible_captcha(page)
+        _safe_click_next(page)
+
+        try:
+            link = anymessage.find_confirmation_link(activation_id)
+        except AnyMessageApiError as exc:
+            # AnyMessage may return temporary "message not found" before first email arrives.
+            _progress(f"AnyMessage pending: {exc}")
+            link = None
+        if link:
+            _progress("Confirmation link received.")
+            return link
+
+        remaining = int(deadline - time.time())
+        _progress(f"No confirmation email yet. Waiting... (~{remaining}s left)")
+        time.sleep(poll_seconds)
+
+    raise AnyMessageApiError(
+        f"Confirmation link not found for activation id={activation_id} in {ANYMESSAGE_MAX_WAIT_SECONDS}s."
+    )
 
 
 def register_calendly_account(account_name: str, ads_profile_id: str) -> RegistrationResult:
@@ -536,9 +597,12 @@ def register_calendly_account(account_name: str, ads_profile_id: str) -> Registr
                 _progress("Checking captcha status")
                 _wait_for_possible_captcha(page)
 
-                _progress("Waiting for confirmation email link from AnyMessage")
-                confirmation_url = anymessage.wait_for_confirmation_link(order.activation_id)
-                _progress("Confirmation link received, opening it")
+                confirmation_url = _wait_confirmation_with_captcha_support(
+                    page=page,
+                    anymessage=anymessage,
+                    activation_id=order.activation_id,
+                )
+                _progress("Opening confirmation link")
                 _finish_email_confirmation(page, confirmation_url, password=password)
                 _progress("Completing Calendly onboarding")
                 _complete_onboarding(page)
@@ -581,7 +645,7 @@ def configure_account_notifications(profile: Profile) -> str:
     with open_ads_page(profile.ads_profile_id) as (page, context):
         _load_cookies_if_present(context, profile.cookie_file)
         page.goto(profile.main_page_url or CALENDLY_MEETING_TYPES_URL, wait_until="domcontentloaded", timeout=90_000)
-        page.wait_for_timeout(2_000)
+        _pause(page, 800)
 
         # Open event type card menu -> Edit.
         _click_first(
@@ -597,7 +661,7 @@ def configure_account_notifications(profile: Profile) -> str:
             # If menu interaction fails, try opening by direct first edit button.
             _click_first(page, ["a:has-text('Edit')", "button:has-text('Edit')"], timeout=8_000)
 
-        page.wait_for_timeout(1_500)
+        _pause(page, 600)
         _click_first(page, ["button:has-text('More options')", "text=More options"], timeout=12_000)
         _click_first(
             page,
@@ -654,7 +718,7 @@ def configure_account_notifications(profile: Profile) -> str:
 
         _click_first(page, ["button:has-text('Save and close')", "button:has-text('Save')"], timeout=10_000)
         _click_first(page, ["button:has-text('Save changes')", "button:has-text('Save')"], timeout=10_000)
-        page.wait_for_timeout(1_200)
+        _pause(page, 500)
 
         cookie_file = _save_cookies(context, profile.name)
         return cookie_file
@@ -769,12 +833,12 @@ def run_booking_sender(
         while email_pool:
             target_url = primary_url if scheduled == 0 else (fallback_url or primary_url)
             page.goto(target_url, wait_until="domcontentloaded", timeout=90_000)
-            page.wait_for_timeout(1_200)
+            _pause(page, 500)
 
             if not _select_first_available_time(page):
                 if fallback_url and target_url != fallback_url:
                     page.goto(fallback_url, wait_until="domcontentloaded", timeout=90_000)
-                    page.wait_for_timeout(1_200)
+                    _pause(page, 500)
                     if not _select_first_available_time(page):
                         raise NoAvailableSlotError("No available slot on date page and fallback booking page.")
                 else:
@@ -800,7 +864,7 @@ def run_booking_sender(
             _write_log(
                 f"Booking scheduled profile={profile.ads_profile_id}; invitee={invitee_email}; guests={len(guest_emails)}"
             )
-            page.wait_for_timeout(1_500)
+            _pause(page, 700)
 
         cookie_file = _save_cookies(context, profile.name)
         _write_log(f"Updated cookie file after booking: {cookie_file}")
