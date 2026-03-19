@@ -488,20 +488,38 @@ def _load_cookies_if_present(context: BrowserContext, cookie_file: str) -> None:
 
 
 def _click_create_with_password(page: Page) -> bool:
-    # Direct robust click for "Prefer to create an account with a password? Click here"
+    # Preferred path: exact link/button with "Click here".
+    if _click_first(
+        page,
+        selectors=[
+            "role=link[name=/^click here$/i]",
+            "a:has-text('Click here')",
+            "button:has-text('Click here')",
+        ],
+        timeout=1_200,
+    ):
+        _pause(page, 120)
+        return True
+
+    # JS fallback: click exact "click here" text and nearest interactive parent.
     try:
         clicked = page.evaluate(
             """
             () => {
+              const isVisible = (el) => {
+                const r = el.getBoundingClientRect();
+                const s = window.getComputedStyle(el);
+                return r.width > 5 && r.height > 5 && s.display !== 'none' && s.visibility !== 'hidden';
+              };
               const nodes = Array.from(document.querySelectorAll('a, button, span, div'));
-              const target = nodes.find((el) => {
-                const txt = (el.innerText || el.textContent || '').trim().toLowerCase();
-                if (!txt.includes('click here')) return false;
-                const rect = el.getBoundingClientRect();
-                return rect.width > 5 && rect.height > 5;
-              });
-              if (target) {
-                target.click();
+              for (const node of nodes) {
+                const txt = (node.textContent || '').trim().toLowerCase();
+                if (txt !== 'click here') continue;
+                if (!isVisible(node)) continue;
+                const clickable = node.closest('a,button,[role="button"]') || node;
+                clickable.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                clickable.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                clickable.dispatchEvent(new MouseEvent('click', { bubbles: true }));
                 return true;
               }
               return false;
@@ -509,21 +527,12 @@ def _click_create_with_password(page: Page) -> bool:
             """
         )
         if clicked:
-            _pause(page, 200)
+            _pause(page, 120)
             return True
     except Exception:  # noqa: BLE001
         pass
 
-    clicked = _click_first(
-        page,
-        selectors=[
-            "a:has-text('Click here')",
-            "button:has-text('Click here')",
-            "text=Prefer to create an account with a password?",
-        ],
-        timeout=1_500,
-    )
-    return clicked
+    return False
 
 
 def _in_password_signup_mode(page: Page) -> bool:
@@ -532,6 +541,15 @@ def _in_password_signup_mode(page: Page) -> bool:
         or page.locator("input[type='password']").count() > 0
         or page.locator("text=/Choose a password/i").count() > 0
     )
+
+
+def _wait_for_password_mode(page: Page, timeout_seconds: int) -> bool:
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        if _in_password_signup_mode(page):
+            return True
+        _pause(page, 120)
+    return _in_password_signup_mode(page)
 
 
 def _signup_page_has_interactive_controls(page: Page) -> bool:
@@ -605,9 +623,18 @@ def _fill_signup_form(page: Page, account_name: str, password: str, email: str) 
         deadline = time.time() + SIGNUP_PASSWORD_SWITCH_TIMEOUT_SECONDS
         while not _in_password_signup_mode(page) and time.time() < deadline:
             _click_create_with_password(page)
-            _wait_signup_state_after_email(page, 2)
+            if _wait_for_password_mode(page, 1):
+                break
+            _pause(page, 200)
         if not _in_password_signup_mode(page):
-            raise CalendlyAutomationError("Could not switch signup flow to password mode.")
+            _progress("Auto click on 'Click here' failed. Manual fallback: click it in browser, then press Enter.")
+            try:
+                if sys.stdin.isatty():
+                    input("[SIGNUP] Нажмите 'Click here' вручную и нажмите Enter...")
+            except EOFError:
+                pass
+            if not _wait_for_password_mode(page, 20):
+                raise CalendlyAutomationError("Could not switch signup flow to password mode.")
 
     if not _fill_first(
         page,
