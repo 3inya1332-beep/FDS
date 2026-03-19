@@ -1,0 +1,2 @@
+Hi {{Invitee Full Name}},
+Your {{Event Name}} with {{My Name}} at {{Event Time}} on {{Event Date}} is scheduled.

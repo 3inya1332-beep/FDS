@@ -1,0 +1,1 @@
+Confirmed: {{Event Name}} with {{My Name}} on {{Event Date}}
