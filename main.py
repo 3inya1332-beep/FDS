@@ -169,17 +169,13 @@ def run_sender_flow(store: ProfileStore) -> None:
     if profile is None:
         return
 
-    date_page_url = input("Вставьте ссылку страницы с датой (можно пусто): ").strip()
-    fallback_booking_url = input(
-        f"Ссылка booking (если нет времени на дате) [{profile.booking_url or '-'}]: "
-    ).strip()
-    if not fallback_booking_url:
-        fallback_booking_url = profile.booking_url
+    booking_url = input(
+        f"Вставьте booking ссылку (пример: https://calendly.com/username/30min) [{profile.booking_url or '-'}]: "
+    ).strip() or profile.booking_url
 
     stats = run_booking_sender(
         profile,
-        date_page_url=date_page_url,
-        fallback_booking_url=fallback_booking_url,
+        booking_url=booking_url,
     )
     print("\nОтправка завершена:")
     print(f"  Запланировано событий: {stats.scheduled_events}")

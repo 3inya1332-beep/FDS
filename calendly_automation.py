@@ -95,6 +95,12 @@ class SendStats:
     remaining_emails: int
 
 
+@dataclass
+class ManualSessionResult:
+    cookie_file: str
+    last_url: str
+
+
 def _progress(message: str) -> None:
     print(f"[INFO] {message}", flush=True)
     _write_log(message)
@@ -1221,6 +1227,37 @@ def register_calendly_account(account_name: str, ads_profile_id: str) -> Registr
     raise CalendlyAutomationError(f"Registration failed after retries: {last_error}")
 
 
+def run_manual_ads_session(
+    *,
+    account_name: str,
+    ads_profile_id: str,
+    start_url: str = CALENDLY_SIGNUP_URL,
+) -> ManualSessionResult:
+    """
+    Manual-assist mode:
+    1) Open ADS profile and target page.
+    2) User performs actions in browser manually.
+    3) After Enter in console, save cookies and return current URL.
+    """
+    ensure_input_files()
+    with open_ads_page(ads_profile_id) as (page, context):
+        _safe_goto_calendly(page, start_url, timeout_ms=60_000)
+        _progress(
+            "Manual ADS mode active. Complete actions in browser, then press Enter in console to save cookies."
+        )
+        try:
+            if sys.stdin.isatty():
+                input("[MANUAL] Завершите действия в браузере и нажмите Enter...")
+        except EOFError:
+            # Non-interactive terminal: keep short wait so caller can still use function.
+            _pause(page, 1_000)
+
+        cookie_file = _save_cookies(context, account_name)
+        current_url = page.url
+        _progress(f"Manual session saved. URL={current_url}")
+        return ManualSessionResult(cookie_file=cookie_file, last_url=current_url)
+
+
 def _dismiss_cookie_banner(page: Page) -> None:
     _click_first(
         page,
@@ -1377,33 +1414,105 @@ def configure_account_notifications(profile: Profile) -> str:
         return cookie_file
 
 
-def _select_first_available_time(page: Page) -> bool:
-    # Try already visible times first.
-    time_button = page.locator("button", has_text=re.compile(r"^\d{1,2}:\d{2}(am|pm)$", re.I)).first
-    if time_button.count() > 0:
-        try:
-            time_button.click()
-            # Some booking pages require second click on "Next"/"Confirm".
-            _click_first(page, ["button:has-text('Next')", "button:has-text('Confirm')"], timeout=4_000)
-            return True
-        except Exception:  # noqa: BLE001
-            pass
+def _is_booking_form_visible(page: Page) -> bool:
+    return (
+        page.locator("input[name='name'], input[aria-label*='Name' i]").count() > 0
+        and page.locator("input[name='email'], input[type='email']").count() > 0
+    )
 
-    # Pick first available date then first time.
-    date_buttons = page.locator("button[aria-label*='available' i], button:not([disabled])")
-    date_count = date_buttons.count()
-    for idx in range(min(date_count, 30)):
-        try:
-            date_buttons.nth(idx).click()
-            _pause(page, 180)
-            time_button = page.locator("button", has_text=re.compile(r"^\d{1,2}:\d{2}(am|pm)$", re.I)).first
-            if time_button.count() > 0:
-                time_button.click()
-                _click_first(page, ["button:has-text('Next')", "button:has-text('Confirm')"], timeout=4_000)
+
+def _click_first_time_button(page: Page) -> bool:
+    selectors = [
+        "button[aria-label*='time' i]",
+        "button:has-text('am')",
+        "button:has-text('pm')",
+    ]
+    for selector in selectors:
+        buttons = page.locator(selector)
+        count = buttons.count()
+        for idx in range(min(count, 20)):
+            btn = buttons.nth(idx)
+            try:
+                if not btn.is_visible():
+                    continue
+                if not btn.is_enabled():
+                    continue
+                txt = (btn.text_content() or "").strip().lower()
+                if not txt:
+                    continue
+                if ":" not in txt and "am" not in txt and "pm" not in txt:
+                    continue
+                btn.click(timeout=1_500)
+                _pause(page, 120)
+                _click_first(page, ["button:has-text('Next')", "button:has-text('Confirm')"], timeout=1_500)
                 return True
-        except Exception:  # noqa: BLE001
-            continue
+            except Exception:  # noqa: BLE001
+                continue
     return False
+
+
+def _click_first_available_date(page: Page) -> bool:
+    date_selectors = [
+        "button[aria-label*='available' i]",
+        "button[data-testid*='calendar-day']",
+        "button[aria-label*='Choose' i]",
+    ]
+    for selector in date_selectors:
+        buttons = page.locator(selector)
+        count = buttons.count()
+        for idx in range(min(count, 62)):
+            btn = buttons.nth(idx)
+            try:
+                if not btn.is_visible() or not btn.is_enabled():
+                    continue
+                btn.click(timeout=1_500)
+                _pause(page, 120)
+                return True
+            except Exception:  # noqa: BLE001
+                continue
+    return False
+
+
+def _go_to_next_calendar_month(page: Page) -> bool:
+    return _click_first(
+        page,
+        [
+            "button[aria-label*='Next month' i]",
+            "button[aria-label*='next' i]",
+            "button:has-text('Next month')",
+            "button:has-text('›')",
+            "button:has-text('>')",
+        ],
+        timeout=1_500,
+    )
+
+
+def _select_first_available_time(page: Page, max_months_ahead: int = 6) -> bool:
+    """
+    Open booking form by picking nearest available date/time.
+    """
+    if _is_booking_form_visible(page):
+        return True
+
+    # Try current month first, then switch months.
+    for month_idx in range(max_months_ahead + 1):
+        if _click_first_time_button(page):
+            if _is_booking_form_visible(page):
+                return True
+
+        # If times are hidden until date chosen, pick date and retry time.
+        if _click_first_available_date(page):
+            if _click_first_time_button(page):
+                if _is_booking_form_visible(page):
+                    return True
+
+        if month_idx < max_months_ahead and _go_to_next_calendar_month(page):
+            _progress(f"No slot in current month, switching to next month ({month_idx + 1}/{max_months_ahead}).")
+            _pause(page, 180)
+            continue
+        break
+
+    return _is_booking_form_visible(page)
 
 
 def _fill_booking_form(page: Page, invitee_name: str, invitee_email: str, guest_emails: list[str]) -> None:
@@ -1463,8 +1572,7 @@ def _fill_booking_form(page: Page, invitee_name: str, invitee_email: str, guest_
 def run_booking_sender(
     profile: Profile,
     *,
-    date_page_url: str,
-    fallback_booking_url: str | None = None,
+    booking_url: str,
 ) -> SendStats:
     ensure_input_files()
     email_pool = load_email_pool()
@@ -1472,30 +1580,24 @@ def run_booking_sender(
         raise CalendlyAutomationError("Email list is empty.")
     total_input = len(email_pool)
 
-    fallback_url = (fallback_booking_url or profile.booking_url or "").strip()
-    if not date_page_url and not fallback_url:
-        raise CalendlyAutomationError("Need a date page URL or account booking URL.")
+    target_booking_url = booking_url.strip() or (profile.booking_url or "").strip()
+    if not target_booking_url:
+        raise CalendlyAutomationError("Нужна ссылка booking страницы.")
 
     scheduled = 0
     consumed = 0
-    primary_url = date_page_url.strip() or fallback_url
 
     with open_ads_page(profile.ads_profile_id) as (page, context):
         _load_cookies_if_present(context, profile.cookie_file)
 
         while email_pool:
-            target_url = primary_url if scheduled == 0 else (fallback_url or primary_url)
-            page.goto(target_url, wait_until="domcontentloaded", timeout=90_000)
-            _pause(page, 500)
+            _progress(f"Opening booking page: {target_booking_url}")
+            _safe_goto_calendly(page, target_booking_url, timeout_ms=60_000)
+            _pause(page, 250)
 
             if not _select_first_available_time(page):
-                if fallback_url and target_url != fallback_url:
-                    page.goto(fallback_url, wait_until="domcontentloaded", timeout=90_000)
-                    _pause(page, 500)
-                    if not _select_first_available_time(page):
-                        raise NoAvailableSlotError("No available slot on date page and fallback booking page.")
-                else:
-                    raise NoAvailableSlotError("No available slot found.")
+                _progress("No available slots found now. Sender stopped without error.")
+                break
 
             invitee_email = email_pool[0]
             guests_limit = min(BOOKING_GUESTS_PER_EVENT, max(len(email_pool) - 1, 0))
@@ -1514,9 +1616,7 @@ def run_booking_sender(
             scheduled += 1
             email_pool = email_pool[used:]
             save_email_pool(email_pool)
-            _write_log(
-                f"Booking scheduled profile={profile.ads_profile_id}; invitee={invitee_email}; guests={len(guest_emails)}"
-            )
+            _progress(f"Booking scheduled: invitee={invitee_email}; guests={len(guest_emails)}")
             _pause(page, 700)
 
         cookie_file = _save_cookies(context, profile.name)
