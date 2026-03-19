@@ -34,6 +34,8 @@ from anymessage_api import AnyMessageApiError, AnyMessageClient
 from config import (
     ADS_HEADLESS,
     ADS_OPEN_TABS,
+    ADS_PROFILE_READY_TIMEOUT_SECONDS,
+    ADS_PROFILE_WARMUP_SECONDS,
     ACTION_SPEED_MULTIPLIER,
     ANYMESSAGE_MAX_WAIT_SECONDS,
     ANYMESSAGE_POLL_SECONDS,
@@ -148,6 +150,33 @@ def _maximize_ads_window(browser: Browser, page: Page) -> None:
         )
     except Exception:  # noqa: BLE001
         pass
+
+
+def _wait_for_ads_profile_ready(context: BrowserContext, page: Page) -> None:
+    _progress("Waiting ADS profile to fully load.")
+    deadline = time.time() + ADS_PROFILE_READY_TIMEOUT_SECONDS
+    last_error: Exception | None = None
+
+    while time.time() < deadline:
+        try:
+            if len(context.pages) == 0:
+                _pause(page, 120)
+                continue
+
+            # Health checks for CDP/page lifecycle.
+            page.wait_for_load_state("domcontentloaded", timeout=2_000)
+            ready_state = page.evaluate("document.readyState")
+            ua = page.evaluate("navigator.userAgent")
+            if ready_state in {"interactive", "complete"} and isinstance(ua, str) and ua:
+                # Small warmup for profile scripts/extensions/cookies.
+                time.sleep(max(0, ADS_PROFILE_WARMUP_SECONDS))
+                _progress("ADS profile ready.")
+                return
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            _pause(page, 120)
+
+    raise CalendlyAutomationError(f"ADS profile did not become ready in time: {last_error}")
 
 
 def _resolve_or_create_dir(candidates: list[Path]) -> Path:
@@ -282,6 +311,7 @@ def open_ads_page(ads_profile_id: str) -> Iterable[tuple[Page, BrowserContext]]:
             except Exception:  # noqa: BLE001
                 pass
             _maximize_ads_window(browser, page)
+            _wait_for_ads_profile_ready(context, page)
             yield page, context
             browser.close()
     finally:
