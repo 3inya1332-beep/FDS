@@ -4,14 +4,21 @@ import sqlite3
 from typing import Iterable
 
 from ads_api import AdsApiError
-from config import DEFAULT_PCLOUD_URL
-from pcloud_automation import PcloudAutomationError, ensure_input_files, run_job
+from coda_automation import (
+    CodaAutomationError,
+    ensure_input_files,
+    get_pending_emails,
+    get_sent_history,
+    run_job,
+)
+from config import DEFAULT_START_URL
 from profile_store import Profile, ProfileStore
 
 
 def print_header() -> None:
     print("\n" + "=" * 60)
-    print("                 ADS + pCloud AUTO INVITER")
+    print("                PCLOUD EVE SENDER")
+    print("             ADS Browser + Coda.io")
     print("=" * 60)
 
 
@@ -41,7 +48,7 @@ def add_profile_flow(store: ProfileStore) -> None:
     print("\nДобавление ADS профиля")
     name = input("Название профиля (любое): ").strip()
     ads_profile_id = input("ADS profile id: ").strip()
-    start_url = input(f"URL старта [{DEFAULT_PCLOUD_URL}]: ").strip() or DEFAULT_PCLOUD_URL
+    start_url = input(f"URL старта [{DEFAULT_START_URL}]: ").strip() or DEFAULT_START_URL
 
     if not name or not ads_profile_id:
         print("Название и ADS profile id обязательны.")
@@ -90,8 +97,32 @@ def run_flow(store: ProfileStore) -> None:
         print(f"  Всего email: {stats.total_emails}")
         print(f"  Отправлено: {stats.sent_emails}")
         print(f"  Ошибочных батчей: {stats.failed_batches}")
-    except (AdsApiError, PcloudAutomationError) as exc:
+        print(f"  Осталось в файле: {stats.remaining_emails}")
+    except (AdsApiError, CodaAutomationError) as exc:
         print(f"Ошибка запуска: {exc}")
+
+
+def show_pending_emails_flow() -> None:
+    pending = get_pending_emails()
+    print("\nНеотправленные email:")
+    if not pending:
+        print("  Список пуст.")
+        return
+    print(f"  Всего: {len(pending)}")
+    for email in pending[:50]:
+        print(f"  - {email}")
+    if len(pending) > 50:
+        print(f"  ... и еще {len(pending) - 50}")
+
+
+def show_sent_history_flow() -> None:
+    history = get_sent_history(limit=50)
+    print("\nОтправленные email (история):")
+    if not history:
+        print("  История пуста.")
+        return
+    for line in history:
+        print(f"  {line}")
 
 
 def show_menu() -> None:
@@ -103,8 +134,10 @@ def show_menu() -> None:
         print("1. Добавить профиль ADS Browser")
         print("2. Показать профили")
         print("3. Удалить профиль")
-        print("4. Запустить создание folder + invite emails")
-        print("5. Выход")
+        print("4. Отправка email + сообщения (Coda Share)")
+        print("5. Показать неотправленные email")
+        print("6. Показать отправленные email (история)")
+        print("7. Выход")
         choice = input("\nВыберите действие: ").strip()
 
         if choice == "1":
@@ -116,6 +149,10 @@ def show_menu() -> None:
         elif choice == "4":
             run_flow(store)
         elif choice == "5":
+            show_pending_emails_flow()
+        elif choice == "6":
+            show_sent_history_flow()
+        elif choice == "7":
             print("Выход.")
             break
         else:

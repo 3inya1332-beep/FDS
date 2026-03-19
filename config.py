@@ -9,17 +9,17 @@ ADS_TIMEOUT_SECONDS = 60
 ADS_HEADLESS = False
 ADS_OPEN_TABS = 1
 
-# pCloud automation defaults
-DEFAULT_PCLOUD_URL = "https://my.pcloud.com/"
-BATCH_SIZE = 20
-BATCH_DELAY_SECONDS = 1.0
+# Coda.io automation defaults
+DEFAULT_START_URL = "https://coda.io/"
+BATCH_SIZE = 30
+BATCH_DELAY_SECONDS = 1.5
 
 # Files and directories
 EDIT_DIR_CANDIDATES = [BASE_DIR / "edit", BASE_DIR / "EDIT"]
 EMAIL_DIR_CANDIDATES = [BASE_DIR / "email", BASE_DIR / "EMAIL"]
-NAME_FILENAME = "NAME.txt"
 TEXT_FILENAME = "text.txt"
 EMAIL_FILENAME = "emails.txt"
 
 PROFILE_DB_PATH = BASE_DIR / "profiles.db"
 LOGS_DIR = BASE_DIR / "logs"
+SENT_EMAILS_LOG_FILENAME = "sent_emails.txt"
