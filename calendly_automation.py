@@ -53,6 +53,8 @@ from config import (
     EMAIL_FILENAME,
     LOGS_DIR,
     REGISTRATION_MAX_ATTEMPTS,
+    SIGNUP_LOAD_CHECK_TIMEOUT_SECONDS,
+    SIGNUP_LOAD_MAX_RELOADS,
     SUBJECT_FILENAME,
 )
 from profile_store import Profile
@@ -504,6 +506,61 @@ def _in_password_signup_mode(page: Page) -> bool:
         page.locator("input[name='password']").count() > 0
         or page.locator("input[type='password']").count() > 0
         or page.locator("text=/Choose a password/i").count() > 0
+    )
+
+
+def _signup_page_has_interactive_controls(page: Page) -> bool:
+    selectors = [
+        "input[name='email']",
+        "input[type='email']",
+        "button:has-text('Continue')",
+        "button:has-text('Sign up with Google')",
+        "text=Continue with Google",
+        "a:has-text('Click here')",
+        "button:has-text('Click here')",
+        "iframe[src*='recaptcha']",
+        "iframe[src*='hcaptcha']",
+    ]
+    for selector in selectors:
+        try:
+            locator = page.locator(selector).first
+            if locator.count() > 0 and locator.is_visible():
+                return True
+        except Exception:  # noqa: BLE001
+            continue
+    return _in_password_signup_mode(page)
+
+
+def _open_signup_page_with_recovery(page: Page) -> None:
+    _progress(f"Opening signup page: {CALENDLY_SIGNUP_URL}")
+    load_error: Exception | None = None
+    for attempt in range(1, SIGNUP_LOAD_MAX_RELOADS + 1):
+        try:
+            if attempt == 1:
+                page.goto(CALENDLY_SIGNUP_URL, wait_until="domcontentloaded", timeout=45_000)
+            else:
+                refreshed_url = f"{CALENDLY_SIGNUP_URL}?r={int(time.time() * 1000)}"
+                page.goto(refreshed_url, wait_until="domcontentloaded", timeout=45_000)
+            _pause(page, 120)
+        except Exception as exc:  # noqa: BLE001
+            load_error = exc
+            _progress(f"Signup open attempt {attempt} navigation error: {exc}")
+
+        start = time.time()
+        while time.time() - start < SIGNUP_LOAD_CHECK_TIMEOUT_SECONDS:
+            if _signup_page_has_interactive_controls(page):
+                _progress(f"Signup page ready after attempt {attempt}.")
+                return
+            _pause(page, 80)
+
+        _progress(f"Signup not fully loaded on attempt {attempt}, refreshing.")
+        try:
+            page.reload(wait_until="domcontentloaded", timeout=30_000)
+        except Exception as exc:  # noqa: BLE001
+            load_error = exc
+
+    raise CalendlyAutomationError(
+        f"Signup page did not fully load after {SIGNUP_LOAD_MAX_RELOADS} attempts: {load_error}"
     )
 
 
@@ -1044,8 +1101,7 @@ def register_calendly_account(account_name: str, ads_profile_id: str) -> Registr
 
         try:
             with open_ads_page(ads_profile_id) as (page, context):
-                _progress(f"Opening signup page: {CALENDLY_SIGNUP_URL}")
-                page.goto(CALENDLY_SIGNUP_URL, wait_until="domcontentloaded", timeout=90_000)
+                _open_signup_page_with_recovery(page)
                 _progress("Filling signup form")
                 _fill_signup_form(page, account_name=account_name, password=password, email=order.email)
                 _progress("Checking captcha status")
@@ -1059,7 +1115,19 @@ def register_calendly_account(account_name: str, ads_profile_id: str) -> Registr
                 _progress("Opening confirmation link")
                 _finish_email_confirmation(page, confirmation_url, password=password)
                 _progress("Completing Calendly onboarding")
-                _complete_onboarding(page)
+                onboarding_ok = False
+                try:
+                    _complete_onboarding(page)
+                    onboarding_ok = True
+                except Exception as onboarding_exc:  # noqa: BLE001
+                    _progress(f"Onboarding warning: {onboarding_exc}")
+                    try:
+                        page.goto(CALENDLY_MEETING_TYPES_URL, wait_until="domcontentloaded", timeout=60_000)
+                        onboarding_ok = True
+                    except Exception as fallback_exc:  # noqa: BLE001
+                        _progress(f"Meeting types fallback failed: {fallback_exc}")
+                if not onboarding_ok:
+                    raise CalendlyAutomationError("Onboarding did not complete and fallback navigation failed.")
 
                 cookie_file = _save_cookies(context, account_name)
                 _progress(f"Registration successful for {order.email}")
