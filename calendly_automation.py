@@ -962,16 +962,23 @@ def _fast_back_from_google(page: Page) -> None:
 def _complete_onboarding(page: Page) -> None:
     _progress("Onboarding flow started.")
     availability_configured = False
+    availability_forced_attempts = 0
     for _ in range(20):
         if "/app/scheduling/meeting_types/" in page.url and availability_configured:
             _progress("Onboarding completed.")
             return
         if "/app/scheduling/meeting_types/" in page.url and not availability_configured:
-            _progress("Meeting types reached before availability setup, forcing availability page.")
-            try:
-                page.goto("https://calendly.com/app/intro/availability", wait_until="domcontentloaded", timeout=30_000)
-            except Exception:  # noqa: BLE001
-                pass
+            if availability_forced_attempts < 1:
+                availability_forced_attempts += 1
+                _progress("Meeting types reached before availability setup, forcing availability page once.")
+                try:
+                    page.goto("https://calendly.com/app/intro/availability", wait_until="domcontentloaded", timeout=30_000)
+                except Exception:  # noqa: BLE001
+                    _progress("Availability force-open failed, continuing without availability setup.")
+                    return
+            else:
+                _progress("Skipping availability setup and finishing registration.")
+                return
 
         if "accounts.google.com" in page.url:
             _progress("Google auth page detected, going back.")
@@ -1033,6 +1040,8 @@ def _complete_onboarding(page: Page) -> None:
                 _configure_weekly_hours(page)
                 availability_configured = True
                 _click_next_until_progress(page, retries=6)
+            else:
+                _progress("Availability screen not detected quickly; continue registration without waiting.")
             continue
 
         if (
@@ -1051,7 +1060,10 @@ def _complete_onboarding(page: Page) -> None:
         _pause(page, 120)
 
     _progress("Onboarding did not auto-finish in time, opening meeting types URL directly.")
-    page.goto(CALENDLY_MEETING_TYPES_URL, wait_until="domcontentloaded", timeout=90_000)
+    try:
+        page.goto(CALENDLY_MEETING_TYPES_URL, wait_until="domcontentloaded", timeout=90_000)
+    except Exception:  # noqa: BLE001
+        _progress("Meeting types fallback navigation failed; finishing anyway.")
 
 
 def _wait_confirmation_with_captcha_support(
