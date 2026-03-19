@@ -30,6 +30,7 @@ class AdsApiClient:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key.strip()
         self.timeout_seconds = timeout_seconds
+        self._preferred_auth_variant: int | None = None
 
     def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
         url = f"{self.base_url}{path}"
@@ -107,7 +108,12 @@ class AdsApiClient:
     ) -> dict[str, Any]:
         base_params = dict(params or {})
         errors: list[str] = []
-        for index, (headers, auth_params) in enumerate(self._auth_variants(), start=1):
+        variants = self._auth_variants()
+        if self._preferred_auth_variant is not None and 0 <= self._preferred_auth_variant < len(variants):
+            preferred = variants[self._preferred_auth_variant]
+            variants = [preferred] + [v for idx, v in enumerate(variants) if idx != self._preferred_auth_variant]
+
+        for index, (headers, auth_params) in enumerate(variants, start=1):
             merged_params = dict(base_params)
             merged_params.update(auth_params)
             kwargs: dict[str, Any] = {"params": merged_params, "headers": headers}
@@ -117,15 +123,21 @@ class AdsApiClient:
                 payload = self._request(method, path, **kwargs)
                 if self._requires_api_key(payload):
                     errors.append(f"auth_variant#{index}: {self._msg(payload)}")
-                    time.sleep(0.5)
+                    time.sleep(0.1)
                     continue
+                # Cache successful auth variant index for faster next calls.
+                if self._preferred_auth_variant is None:
+                    for original_idx, original in enumerate(self._auth_variants()):
+                        if original == (headers, auth_params):
+                            self._preferred_auth_variant = original_idx
+                            break
                 return payload
             except requests.HTTPError as exc:
                 errors.append(f"auth_variant#{index}: HTTP {exc}")
-                time.sleep(0.5)
+                time.sleep(0.1)
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"auth_variant#{index}: {exc}")
-                time.sleep(0.5)
+                time.sleep(0.1)
 
         raise AdsApiError("Auth fallback exhausted. " + " | ".join(errors))
 
@@ -186,12 +198,12 @@ class AdsApiClient:
             (
                 "GET",
                 "/api/v1/browser/start",
-                {"params": {"user_id": profile_id}},
+                {"params": {"user_id": profile_id, "headless": int(headless), "open_tabs": open_tabs}},
             ),
             (
                 "GET",
                 "/api/v1/browser/start",
-                {"params": {"profile_id": profile_id}},
+                {"params": {"profile_id": profile_id, "headless": int(headless), "open_tabs": open_tabs}},
             ),
         ]
 
@@ -207,17 +219,17 @@ class AdsApiClient:
                 if not self._is_success(response_payload):
                     errors.append(str(response_payload))
                     # Avoid hitting ADS rate limits while trying fallback payloads.
-                    time.sleep(0.7)
+                    time.sleep(0.2)
                     continue
                 data = self._data_from_payload(response_payload)
                 cdp_url = self._extract_cdp_url(data)
                 if cdp_url:
                     return AdsBrowserSession(profile_id=profile_id, cdp_url=cdp_url)
                 errors.append(f"CDP endpoint not found in payload: {response_payload}")
-                time.sleep(0.7)
+                time.sleep(0.2)
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"{method} {path} failed: {exc}")
-                time.sleep(0.7)
+                time.sleep(0.2)
 
         raise AdsApiError("Unable to start ADS browser profile. " + " | ".join(errors))
 

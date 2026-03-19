@@ -13,10 +13,18 @@ from pathlib import Path
 from typing import Any, Iterable
 
 try:
-    from playwright.sync_api import Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
+    from playwright.sync_api import (
+        Browser,
+        BrowserContext,
+        Locator,
+        Page,
+        TimeoutError as PlaywrightTimeoutError,
+        sync_playwright,
+    )
 except ModuleNotFoundError:  # pragma: no cover - runtime dependency check
     Browser = Any  # type: ignore[assignment]
     BrowserContext = Any  # type: ignore[assignment]
+    Locator = Any  # type: ignore[assignment]
     Page = Any  # type: ignore[assignment]
     PlaywrightTimeoutError = TimeoutError
     sync_playwright = None
@@ -107,9 +115,37 @@ def _maximize_ads_window(browser: Browser, page: Page) -> None:
     except Exception:  # noqa: BLE001
         pass
 
+    # Try page-level CDP session as fallback for ADS windows.
+    try:
+        page_cdp = page.context.new_cdp_session(page)
+        info = page_cdp.send("Browser.getWindowForTarget")
+        window_id = info.get("windowId")
+        if window_id:
+            page_cdp.send(
+                "Browser.setWindowBounds",
+                {"windowId": window_id, "bounds": {"windowState": "maximized"}},
+            )
+    except Exception:  # noqa: BLE001
+        pass
+
     # Fallback to large viewport.
     try:
-        page.set_viewport_size({"width": 1920, "height": 1080})
+        page.set_viewport_size({"width": 2560, "height": 1440})
+    except Exception:  # noqa: BLE001
+        pass
+
+    # JS fallback for non-standard window managers.
+    try:
+        page.evaluate(
+            """
+            () => {
+              try {
+                window.moveTo(0, 0);
+                window.resizeTo(screen.availWidth, screen.availHeight);
+              } catch (e) {}
+            }
+            """
+        )
     except Exception:  # noqa: BLE001
         pass
 
@@ -238,13 +274,14 @@ def open_ads_page(ads_profile_id: str) -> Iterable[tuple[Page, BrowserContext]]:
             # Always use a fresh tab for deterministic automation.
             page = context.new_page()
             _maximize_ads_window(browser, page)
-            page.set_default_timeout(12_000)
-            page.set_default_navigation_timeout(60_000)
+            page.set_default_timeout(8_000)
+            page.set_default_navigation_timeout(45_000)
             page.bring_to_front()
             try:
                 page.goto("about:blank", wait_until="domcontentloaded", timeout=20_000)
             except Exception:  # noqa: BLE001
                 pass
+            _maximize_ads_window(browser, page)
             yield page, context
             browser.close()
     finally:
@@ -252,19 +289,22 @@ def open_ads_page(ads_profile_id: str) -> Iterable[tuple[Page, BrowserContext]]:
         _progress(f"ADS profile {ads_profile_id} stopped")
 
 
-def _click_first(page: Page, selectors: list[str], timeout: int = 5_000) -> bool:
+def _click_first(page: Page, selectors: list[str], timeout: int = 3_000) -> bool:
     for selector in selectors:
         locator = page.locator(selector).first
         try:
             locator.wait_for(state="visible", timeout=timeout)
-            locator.click()
+            try:
+                locator.click(timeout=timeout)
+            except Exception:  # noqa: BLE001
+                locator.click(timeout=timeout, force=True)
             return True
         except Exception:  # noqa: BLE001
             continue
     return False
 
 
-def _fill_first(page: Page, selectors: list[str], value: str, timeout: int = 5_000) -> bool:
+def _fill_first(page: Page, selectors: list[str], value: str, timeout: int = 3_000) -> bool:
     for selector in selectors:
         locator = page.locator(selector).first
         try:
@@ -517,6 +557,38 @@ def _click_label_option(page: Page, label: str) -> bool:
         text_node.click()
         return True
     except Exception:  # noqa: BLE001
+        pass
+
+    # Last fallback: JS click nearest interactive element by text.
+    try:
+        clicked = page.evaluate(
+            """
+            (labelText) => {
+              const nodes = Array.from(document.querySelectorAll('button, [role="button"], label, div, span'));
+              const visible = nodes.filter((el) => {
+                const txt = (el.innerText || el.textContent || '').trim();
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return txt.toLowerCase().includes(labelText.toLowerCase())
+                  && style.visibility !== 'hidden'
+                  && style.display !== 'none'
+                  && rect.width > 20
+                  && rect.height > 10;
+              });
+              for (const node of visible) {
+                const clickable = node.closest('button, [role="button"], label, a, div');
+                if (clickable) {
+                  clickable.click();
+                  return true;
+                }
+              }
+              return false;
+            }
+            """,
+            label,
+        )
+        return bool(clicked)
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -530,7 +602,7 @@ def _choose_random_labels(page: Page, labels: list[str], min_clicks: int = 1, ma
             break
         if _click_label_option(page, label):
             clicked += 1
-            _pause(page, 120)
+            _pause(page, 60)
     return clicked
 
 
@@ -547,37 +619,60 @@ def _click_next_until_progress(page: Page, retries: int = 4) -> bool:
 
 
 def _configure_weekly_hours(page: Page) -> None:
-    # Set full day availability for all visible day rows: 12:00am - 11:00pm
-    rows = page.locator("div:has(input[aria-label*='start' i]), div:has(input[value*=':'])")
-    row_count = rows.count()
-    if row_count == 0:
-        # fallback by generic time inputs
-        inputs = page.locator("input").all()
-        for index, input_node in enumerate(inputs):
-            try:
-                if index % 2 == 0:
-                    input_node.fill("12:00am")
-                else:
-                    input_node.fill("11:00pm")
-            except Exception:  # noqa: BLE001
+    # Requirement: enable first+last unavailable day with plus buttons,
+    # then set all day ranges to 12:00am - 12:00pm.
+    _progress("Applying weekly hours: 12:00am - 12:00pm for all days.")
+
+    plus_candidates = [
+        "button[aria-label*='add' i]",
+        "button[title*='add' i]",
+        "xpath=(//div[normalize-space()='S']/following::button[1])[1]",
+        "xpath=(//div[normalize-space()='S']/following::button[1])[last()]",
+    ]
+    for selector in plus_candidates:
+        try:
+            locator = page.locator(selector)
+            count = locator.count()
+            if count == 0:
                 continue
+            if count == 1:
+                locator.first.click(timeout=1_500)
+                _pause(page, 80)
+            else:
+                locator.first.click(timeout=1_500)
+                _pause(page, 80)
+                locator.last.click(timeout=1_500)
+                _pause(page, 80)
+        except Exception:  # noqa: BLE001
+            continue
+
+    # Fill all visible time inputs in start/end pairs.
+    time_inputs = page.locator("input[value*=':'], input[placeholder*=':'], input[aria-label*='time' i]")
+    count = time_inputs.count()
+    if count < 2:
         return
 
-    for idx in range(row_count):
-        row = rows.nth(idx)
-        time_inputs = row.locator("input")
-        if time_inputs.count() < 2:
-            continue
+    def fill_time(input_locator: Locator, value: str) -> None:
+        input_locator.click(timeout=1_500)
+        page.keyboard.press("Control+A")
+        page.keyboard.type(value, delay=0)
+        page.keyboard.press("Enter")
+
+    max_inputs = min(count, 14)  # 7 days * 2 columns
+    for index in range(max_inputs):
         try:
-            time_inputs.nth(0).fill("12:00am")
-            time_inputs.nth(1).fill("11:00pm")
+            if index % 2 == 0:
+                fill_time(time_inputs.nth(index), "12:00am")
+            else:
+                fill_time(time_inputs.nth(index), "12:00pm")
+            _pause(page, 40)
         except Exception:  # noqa: BLE001
             continue
 
 
 def _complete_onboarding(page: Page) -> None:
     _progress("Onboarding flow started.")
-    for _ in range(14):
+    for _ in range(20):
         if "/app/scheduling/meeting_types/" in page.url:
             _progress("Onboarding completed.")
             return
@@ -585,7 +680,7 @@ def _complete_onboarding(page: Page) -> None:
         if "accounts.google.com" in page.url:
             _progress("Google auth page detected, going back.")
             page.go_back(wait_until="domcontentloaded")
-            _pause(page, 250)
+            _pause(page, 120)
             _click_next_until_progress(page, retries=2)
             continue
 
@@ -607,7 +702,7 @@ def _complete_onboarding(page: Page) -> None:
             )
             if top_clicked == 0 or help_clicked == 0:
                 raise CalendlyAutomationError("Could not select onboarding options on /app/intro/team")
-            _click_next_until_progress(page)
+            _click_next_until_progress(page, retries=5)
             continue
 
         if page.locator("text=/What is your role\\?/i").count() > 0 or "/app/intro/role" in page.url:
@@ -620,26 +715,31 @@ def _complete_onboarding(page: Page) -> None:
             )
             if role_clicked == 0:
                 raise CalendlyAutomationError("Could not select role on onboarding page.")
-            _click_next_until_progress(page)
+            _click_next_until_progress(page, retries=5)
             continue
 
         if (
             page.locator("text=/Set up how your Google calendar will be used/i").count() > 0
             or page.locator("text=/Google calendar/i").count() > 0
+            or "/app/intro/calendar" in page.url
         ):
             _progress("Calendar connect step detected, skipping via Next.")
-            _click_next_until_progress(page, retries=3)
+            _click_next_until_progress(page, retries=5)
             continue
 
-        if page.locator("text=/When are you available to meet with people/i").count() > 0:
+        if (
+            page.locator("text=/When are you available to meet with people/i").count() > 0
+            or page.locator("text=/Weekly hours/i").count() > 0
+            or "/app/intro/availability" in page.url
+        ):
             _progress("Configuring weekly hours.")
             _configure_weekly_hours(page)
-            _click_next_until_progress(page, retries=4)
+            _click_next_until_progress(page, retries=6)
             continue
 
         # Generic fallback for other intro steps.
         _safe_click_next(page)
-        _pause(page, 250)
+        _pause(page, 120)
 
     _progress("Onboarding did not auto-finish in time, opening meeting types URL directly.")
     page.goto(CALENDLY_MEETING_TYPES_URL, wait_until="domcontentloaded", timeout=90_000)
@@ -741,6 +841,93 @@ def register_calendly_account(account_name: str, ads_profile_id: str) -> Registr
     raise CalendlyAutomationError(f"Registration failed after retries: {last_error}")
 
 
+def _dismiss_cookie_banner(page: Page) -> None:
+    _click_first(
+        page,
+        [
+            "button:has-text('Accept')",
+            "button:has-text('Allow all')",
+            "button:has-text('Got it')",
+            "button[aria-label*='close' i]",
+        ],
+        timeout=1_500,
+    )
+
+
+def _open_event_editor_panel(page: Page) -> bool:
+    _dismiss_cookie_banner(page)
+    _pause(page, 120)
+
+    # Fast path: click the first event card title.
+    event_title = page.get_by_text(re.compile(r"\d+\s*Minute Meeting|Meeting", re.I)).first
+    try:
+        event_title.wait_for(state="visible", timeout=4_000)
+        event_title.click()
+        _pause(page, 250)
+        if page.locator("text=/Event type/i").count() > 0 or page.locator("text=/More options/i").count() > 0:
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Fallback: hover card and use three dots -> Edit.
+    try:
+        event_title.hover(timeout=2_000)
+    except Exception:  # noqa: BLE001
+        pass
+
+    if _click_first(
+        page,
+        [
+            "button:right-of(:text('Copy link'))",
+            "button[aria-label*='more' i]",
+            "button[aria-haspopup='menu']",
+        ],
+        timeout=4_000,
+    ):
+        if _click_first(
+            page,
+            [
+                "role=menuitem[name=/Edit/i]",
+                "text=Edit",
+                "button:has-text('Edit')",
+            ],
+            timeout=4_000,
+        ):
+            _pause(page, 250)
+            return True
+
+    return page.locator("text=/Event type/i").count() > 0 or page.locator("text=/More options/i").count() > 0
+
+
+def _open_email_confirmation_editor(page: Page) -> bool:
+    # Enter detailed settings panel.
+    _click_first(page, ["button:has-text('More options')", "text=More options"], timeout=4_000)
+    _click_first(
+        page,
+        [
+            "button:has-text('Notifications and workflows')",
+            "text=Notifications and workflows",
+        ],
+        timeout=4_000,
+    )
+
+    # Try opening row menu for "Email confirmation".
+    if _click_first(
+        page,
+        [
+            "text=Email confirmation >> xpath=following::button[1]",
+            "div:has-text('Email confirmation') button[aria-haspopup='menu']",
+            "text=Email confirmation",
+        ],
+        timeout=4_000,
+    ):
+        if _click_first(page, ["role=menuitem[name=/Edit/i]", "text=Edit", "button:has-text('Edit')"], timeout=4_000):
+            return True
+
+    # Sometimes clicking the row opens editor directly.
+    return page.locator("text=/Subject/i").count() > 0 and page.locator("text=/Body/i").count() > 0
+
+
 def configure_account_notifications(profile: Profile) -> str:
     ensure_input_files()
     subject, body = load_templates()
@@ -748,43 +935,13 @@ def configure_account_notifications(profile: Profile) -> str:
     with open_ads_page(profile.ads_profile_id) as (page, context):
         _load_cookies_if_present(context, profile.cookie_file)
         page.goto(profile.main_page_url or CALENDLY_MEETING_TYPES_URL, wait_until="domcontentloaded", timeout=90_000)
-        _pause(page, 800)
+        _pause(page, 250)
 
-        # Open event type card menu -> Edit.
-        _click_first(
-            page,
-            selectors=[
-                "button:has-text('Copy link') + button",
-                "button[aria-label*='more' i]",
-                "button[aria-haspopup='menu']",
-            ],
-            timeout=12_000,
-        )
-        if not _click_first(page, ["text=Edit", "button:has-text('Edit')"], timeout=8_000):
-            # If menu interaction fails, try opening by direct first edit button.
-            _click_first(page, ["a:has-text('Edit')", "button:has-text('Edit')"], timeout=8_000)
+        if not _open_event_editor_panel(page):
+            raise CalendlyAutomationError("Could not open event editor panel (three dots -> Edit).")
 
-        _pause(page, 600)
-        _click_first(page, ["button:has-text('More options')", "text=More options"], timeout=12_000)
-        _click_first(
-            page,
-            [
-                "button:has-text('Notifications and workflows')",
-                "text=Notifications and workflows",
-            ],
-            timeout=10_000,
-        )
-
-        # Open email confirmation editor.
-        _click_first(
-            page,
-            selectors=[
-                "div:has-text('Email confirmation') button[aria-haspopup='menu']",
-                "text=Email confirmation",
-            ],
-            timeout=10_000,
-        )
-        _click_first(page, ["text=Edit", "button:has-text('Edit')"], timeout=8_000)
+        if not _open_email_confirmation_editor(page):
+            raise CalendlyAutomationError("Could not open Email confirmation editor.")
 
         # Subject contenteditable / textarea.
         if not _fill_first(
@@ -796,13 +953,12 @@ def configure_account_notifications(profile: Profile) -> str:
                 "div[role='textbox'][contenteditable='true']",
             ],
             value=subject,
-            timeout=10_000,
+            timeout=6_000,
         ):
-            # Rich editor fallback.
             subj_box = page.locator("text=Subject").first.locator("xpath=following::div[@contenteditable='true'][1]")
             subj_box.click()
             page.keyboard.press("Control+A")
-            page.keyboard.type(subject)
+            page.keyboard.type(subject, delay=0)
 
         if not _fill_first(
             page,
@@ -812,16 +968,16 @@ def configure_account_notifications(profile: Profile) -> str:
                 "div[aria-label*='Body' i][contenteditable='true']",
             ],
             value=body,
-            timeout=10_000,
+            timeout=6_000,
         ):
             body_box = page.locator("text=Body").first.locator("xpath=following::div[@contenteditable='true'][1]")
             body_box.click()
             page.keyboard.press("Control+A")
-            page.keyboard.type(body)
+            page.keyboard.type(body, delay=0)
 
-        _click_first(page, ["button:has-text('Save and close')", "button:has-text('Save')"], timeout=10_000)
-        _click_first(page, ["button:has-text('Save changes')", "button:has-text('Save')"], timeout=10_000)
-        _pause(page, 500)
+        _click_first(page, ["button:has-text('Save and close')", "button:has-text('Save')"], timeout=5_000)
+        _click_first(page, ["button:has-text('Save changes')", "button:has-text('Save')"], timeout=5_000)
+        _pause(page, 150)
 
         cookie_file = _save_cookies(context, profile.name)
         return cookie_file
@@ -845,7 +1001,7 @@ def _select_first_available_time(page: Page) -> bool:
     for idx in range(min(date_count, 30)):
         try:
             date_buttons.nth(idx).click()
-            page.wait_for_timeout(600)
+            _pause(page, 180)
             time_button = page.locator("button", has_text=re.compile(r"^\d{1,2}:\d{2}(am|pm)$", re.I)).first
             if time_button.count() > 0:
                 time_button.click()
