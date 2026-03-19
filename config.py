@@ -5,12 +5,12 @@ BASE_DIR = Path(__file__).resolve().parent
 
 # ADS Browser local API.
 LOCAL_API_BASE = "http://127.0.0.1:50325"
-API_KEY = os.getenv("ADS_API_KEY", "PASTE_YOUR_ADS_API_KEY")
+API_KEY = os.getenv("ADS_API_KEY", "0b164afcd0bf4a80370594b331f1aa0b0086cd551c0bdc24")
 ADS_TIMEOUT_SECONDS = 90
 ADS_HEADLESS = False
 ADS_OPEN_TABS = 1
 ADS_PROFILE_READY_TIMEOUT_SECONDS = 30
-ADS_PROFILE_WARMUP_SECONDS = 1
+ADS_PROFILE_WARMUP_SECONDS = 0
 
 # Calendly URLs.
 CALENDLY_SIGNUP_URL = "https://calendly.com/signup"
@@ -19,6 +19,8 @@ SIGNUP_LOAD_CHECK_TIMEOUT_SECONDS = 8
 SIGNUP_LOAD_MAX_RELOADS = 4
 SIGNUP_INITIAL_DELAY_SECONDS = 4
 SIGNUP_WAIT_FOREVER_IF_NOT_READY = True
+SIGNUP_POST_EMAIL_WAIT_SECONDS = 20
+SIGNUP_PASSWORD_SWITCH_TIMEOUT_SECONDS = 35
 
 # AnyMessage email activation API.
 # Docs reference: https://anymessage.shop/en/docs
@@ -44,8 +46,9 @@ CAPTCHA_MODE = "manual"  # manual | auto_wait
 CAPTCHA_MANUAL_TIMEOUT_SECONDS = 600
 
 # Runtime speed multiplier for explicit UI pauses.
-# 1.0 = original speed, 0.5 = ~2x faster, 0.25 = ~4x faster, 0.1 = very fast.
-ACTION_SPEED_MULTIPLIER = 0.1
+# 1.0 = original speed, 0.5 = ~2x faster, 0.25 = ~4x faster.
+# 0.2 keeps actions fast but less race-prone on slow page states.
+ACTION_SPEED_MULTIPLIER = 0.2
 
 # Booking settings.
 BOOKING_GUESTS_PER_EVENT = 10

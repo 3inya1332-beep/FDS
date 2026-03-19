@@ -56,6 +56,8 @@ from config import (
     SIGNUP_INITIAL_DELAY_SECONDS,
     SIGNUP_LOAD_CHECK_TIMEOUT_SECONDS,
     SIGNUP_LOAD_MAX_RELOADS,
+    SIGNUP_PASSWORD_SWITCH_TIMEOUT_SECONDS,
+    SIGNUP_POST_EMAIL_WAIT_SECONDS,
     SIGNUP_WAIT_FOREVER_IF_NOT_READY,
     SUBJECT_FILENAME,
 )
@@ -554,6 +556,18 @@ def _signup_page_has_interactive_controls(page: Page) -> bool:
     return _in_password_signup_mode(page)
 
 
+def _wait_signup_state_after_email(page: Page, timeout_seconds: int) -> None:
+    """
+    After clicking continue on email step, Calendly can show loading skeleton for a while.
+    Wait for any actionable signup state before moving on.
+    """
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        if _signup_page_has_interactive_controls(page):
+            return
+        _pause(page, 120)
+
+
 def _open_signup_page_with_recovery(page: Page) -> None:
     _progress(f"Opening signup page: {CALENDLY_SIGNUP_URL}")
     _safe_goto_calendly(page, CALENDLY_SIGNUP_URL, timeout_ms=45_000)
@@ -586,12 +600,12 @@ def _fill_signup_form(page: Page, account_name: str, password: str, email: str) 
         )
         if email_filled:
             _safe_click_next(page)
-            _pause(page, 200)
+            _wait_signup_state_after_email(page, SIGNUP_POST_EMAIL_WAIT_SECONDS)
         # Case 2: email already pre-filled page (as in your screenshot) - go directly via Click here.
-        deadline = time.time() + 8
+        deadline = time.time() + SIGNUP_PASSWORD_SWITCH_TIMEOUT_SECONDS
         while not _in_password_signup_mode(page) and time.time() < deadline:
             _click_create_with_password(page)
-            _pause(page, 150)
+            _wait_signup_state_after_email(page, 2)
         if not _in_password_signup_mode(page):
             raise CalendlyAutomationError("Could not switch signup flow to password mode.")
 
