@@ -355,6 +355,8 @@ def _click_first(page: Page, selectors: list[str], timeout: int = 1_500) -> bool
     for selector in selectors:
         locator = page.locator(selector).first
         try:
+            if locator.count() == 0:
+                continue
             locator.wait_for(state="visible", timeout=timeout)
             try:
                 locator.click(timeout=timeout)
@@ -370,6 +372,8 @@ def _fill_first(page: Page, selectors: list[str], value: str, timeout: int = 1_5
     for selector in selectors:
         locator = page.locator(selector).first
         try:
+            if locator.count() == 0:
+                continue
             locator.wait_for(state="visible", timeout=timeout)
             locator.fill(value)
             return True
@@ -1562,6 +1566,8 @@ def _select_first_available_time(page: Page, max_months_ahead: int = 6) -> bool:
 
 
 def _fill_booking_form(page: Page, invitee_name: str, invitee_email: str, guest_emails: list[str]) -> None:
+    _progress("Filling Enter Details form.")
+
     # Try strict selectors first.
     name_filled = _fill_first(
         page,
@@ -1572,7 +1578,7 @@ def _fill_booking_form(page: Page, invitee_name: str, invitee_email: str, guest_
             "xpath=//*[contains(translate(.,'NAME','name'),'name')]/following::input[1]",
         ],
         invitee_name,
-        timeout=20_000,
+        timeout=1_800,
     )
     if not name_filled:
         # Fallback: first visible text input on form.
@@ -1588,6 +1594,33 @@ def _fill_booking_form(page: Page, invitee_name: str, invitee_email: str, guest_
             except Exception:  # noqa: BLE001
                 continue
     if not name_filled:
+        # Final JS fallback.
+        try:
+            name_filled = bool(
+                page.evaluate(
+                    """
+                    (value) => {
+                      const inputs = Array.from(document.querySelectorAll('input:not([type="hidden"])'));
+                      const visible = inputs.filter((el) => {
+                        const r = el.getBoundingClientRect();
+                        const s = window.getComputedStyle(el);
+                        return r.width > 40 && r.height > 18 && s.display !== 'none' && s.visibility !== 'hidden';
+                      });
+                      if (!visible.length) return false;
+                      const target = visible[0];
+                      target.focus();
+                      target.value = value;
+                      target.dispatchEvent(new Event('input', { bubbles: true }));
+                      target.dispatchEvent(new Event('change', { bubbles: true }));
+                      return true;
+                    }
+                    """,
+                    invitee_name,
+                )
+            )
+        except Exception:  # noqa: BLE001
+            name_filled = False
+    if not name_filled:
         raise CalendlyAutomationError("Invitee Name input not found.")
 
     email_filled = _fill_first(
@@ -1600,7 +1633,7 @@ def _fill_booking_form(page: Page, invitee_name: str, invitee_email: str, guest_
             "xpath=//*[contains(translate(.,'EMAIL','email'),'email')]/following::input[1]",
         ],
         invitee_email,
-        timeout=20_000,
+        timeout=1_800,
     )
     if not email_filled:
         # Fallback: second visible text-like input on form.
@@ -1620,9 +1653,37 @@ def _fill_booking_form(page: Page, invitee_name: str, invitee_email: str, guest_
             except Exception:  # noqa: BLE001
                 pass
     if not email_filled:
+        # Final JS fallback.
+        try:
+            email_filled = bool(
+                page.evaluate(
+                    """
+                    (value) => {
+                      const inputs = Array.from(document.querySelectorAll('input:not([type="hidden"])'));
+                      const visible = inputs.filter((el) => {
+                        const r = el.getBoundingClientRect();
+                        const s = window.getComputedStyle(el);
+                        return r.width > 40 && r.height > 18 && s.display !== 'none' && s.visibility !== 'hidden';
+                      });
+                      if (visible.length < 2) return false;
+                      const target = visible[1];
+                      target.focus();
+                      target.value = value;
+                      target.dispatchEvent(new Event('input', { bubbles: true }));
+                      target.dispatchEvent(new Event('change', { bubbles: true }));
+                      return true;
+                    }
+                    """,
+                    invitee_email,
+                )
+            )
+        except Exception:  # noqa: BLE001
+            email_filled = False
+    if not email_filled:
         raise CalendlyAutomationError("Invitee Email input not found.")
 
     if guest_emails:
+        _progress(f"Adding guests: {len(guest_emails)}")
         _click_first(
             page,
             [
@@ -1670,6 +1731,7 @@ def _fill_booking_form(page: Page, invitee_name: str, invitee_email: str, guest_
     ):
         raise CalendlyAutomationError("Schedule button not found.")
 
+    _progress("Waiting booking confirmation.")
     try:
         page.wait_for_selector("text=/scheduled|confirmed|you are scheduled/i", timeout=25_000)
     except Exception as exc:  # noqa: BLE001
