@@ -431,6 +431,32 @@ def _load_cookies_if_present(context: BrowserContext, cookie_file: str) -> None:
 
 
 def _click_create_with_password(page: Page) -> None:
+    # Direct robust click for "Prefer to create an account with a password? Click here"
+    try:
+        clicked = page.evaluate(
+            """
+            () => {
+              const nodes = Array.from(document.querySelectorAll('a, button, span, div'));
+              const target = nodes.find((el) => {
+                const txt = (el.innerText || el.textContent || '').trim().toLowerCase();
+                if (!txt.includes('click here')) return false;
+                const rect = el.getBoundingClientRect();
+                return rect.width > 5 && rect.height > 5;
+              });
+              if (target) {
+                target.click();
+                return true;
+              }
+              return false;
+            }
+            """
+        )
+        if clicked:
+            _pause(page, 200)
+            return
+    except Exception:  # noqa: BLE001
+        pass
+
     clicked = _click_first(
         page,
         selectors=[
@@ -444,24 +470,35 @@ def _click_create_with_password(page: Page) -> None:
         raise CalendlyAutomationError("Could not switch signup flow to password mode.")
 
 
+def _in_password_signup_mode(page: Page) -> bool:
+    return (
+        page.locator("input[name='password']").count() > 0
+        or page.locator("input[type='password']").count() > 0
+        or page.locator("text=/Choose a password/i").count() > 0
+    )
+
+
 def _fill_signup_form(page: Page, account_name: str, password: str, email: str) -> None:
-    if not _fill_first(
-        page,
-        [
-            "input[name='email']",
-            "input[type='email']",
-            "input[autocomplete='email']",
-        ],
-        email,
-        timeout=20_000,
-    ):
-        raise CalendlyAutomationError("Email input not found on signup page.")
-
-    # On initial signup page email often triggers next state automatically.
-    _safe_click_next(page)
-    _pause(page, 400)
-
-    _click_create_with_password(page)
+    _progress("Signup: switching to password flow.")
+    if not _in_password_signup_mode(page):
+        # Case 1: initial page with email input.
+        email_filled = _fill_first(
+            page,
+            [
+                "input[name='email']",
+                "input[type='email']",
+                "input[autocomplete='email']",
+            ],
+            email,
+            timeout=4_000,
+        )
+        if email_filled:
+            _safe_click_next(page)
+            _pause(page, 200)
+        # Case 2: email already pre-filled page (as in your screenshot) - go directly via Click here.
+        if not _in_password_signup_mode(page):
+            _click_create_with_password(page)
+            _pause(page, 250)
 
     if not _fill_first(
         page,
@@ -471,7 +508,7 @@ def _fill_signup_form(page: Page, account_name: str, password: str, email: str) 
             "input[placeholder*='full name' i]",
         ],
         account_name,
-        timeout=20_000,
+        timeout=8_000,
     ):
         raise CalendlyAutomationError("Full name input not found.")
 
@@ -482,7 +519,7 @@ def _fill_signup_form(page: Page, account_name: str, password: str, email: str) 
             "input[type='password']",
         ],
         password,
-        timeout=20_000,
+        timeout=8_000,
     ):
         raise CalendlyAutomationError("Password input not found.")
 
