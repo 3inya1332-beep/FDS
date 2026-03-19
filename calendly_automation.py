@@ -73,6 +73,11 @@ class SendStats:
     remaining_emails: int
 
 
+def _progress(message: str) -> None:
+    print(f"[INFO] {message}", flush=True)
+    _write_log(message)
+
+
 def _resolve_or_create_dir(candidates: list[Path]) -> Path:
     for folder in candidates:
         if folder.exists():
@@ -182,6 +187,7 @@ def open_ads_page(ads_profile_id: str) -> Iterable[tuple[Page, BrowserContext]]:
         raise CalendlyAutomationError("playwright is not installed. Run: pip install -r requirements.txt")
 
     ads_client = AdsApiClient()
+    _progress(f"Starting ADS profile {ads_profile_id}")
     session = ads_client.start_browser(
         profile_id=ads_profile_id,
         headless=ADS_HEADLESS,
@@ -190,13 +196,23 @@ def open_ads_page(ads_profile_id: str) -> Iterable[tuple[Page, BrowserContext]]:
     browser: Browser | None = None
     try:
         with sync_playwright() as playwright:
+            _progress(f"Connecting to ADS CDP {session.cdp_url}")
             browser = playwright.chromium.connect_over_cdp(session.cdp_url)
             context = browser.contexts[0] if browser.contexts else browser.new_context()
-            page = context.pages[0] if context.pages else context.new_page()
+            # Always use a fresh tab for deterministic automation.
+            page = context.new_page()
+            page.set_default_timeout(20_000)
+            page.set_default_navigation_timeout(90_000)
+            page.bring_to_front()
+            try:
+                page.goto("about:blank", wait_until="domcontentloaded", timeout=20_000)
+            except Exception:  # noqa: BLE001
+                pass
             yield page, context
             browser.close()
     finally:
         ads_client.stop_browser(session.profile_id)
+        _progress(f"ADS profile {ads_profile_id} stopped")
 
 
 def _click_first(page: Page, selectors: list[str], timeout: int = 5_000) -> bool:
@@ -459,22 +475,30 @@ def register_calendly_account(account_name: str, ads_profile_id: str) -> Registr
     last_error: Exception | None = None
 
     for attempt in range(1, REGISTRATION_MAX_ATTEMPTS + 1):
+        _progress(f"Registration attempt {attempt}/{REGISTRATION_MAX_ATTEMPTS}")
         password = _generate_password()
+        _progress("Ordering email via AnyMessage API")
         order = anymessage.order_email()
-        _write_log(f"Registration attempt={attempt}; email={order.email}; activation_id={order.activation_id}")
+        _progress(f"Got email {order.email} (id={order.activation_id})")
 
         try:
             with open_ads_page(ads_profile_id) as (page, context):
+                _progress(f"Opening signup page: {CALENDLY_SIGNUP_URL}")
                 page.goto(CALENDLY_SIGNUP_URL, wait_until="domcontentloaded", timeout=90_000)
+                _progress("Filling signup form")
                 _fill_signup_form(page, account_name=account_name, password=password, email=order.email)
+                _progress("Checking captcha status")
                 _wait_for_possible_captcha(page)
 
+                _progress("Waiting for confirmation email link from AnyMessage")
                 confirmation_url = anymessage.wait_for_confirmation_link(order.activation_id)
+                _progress("Confirmation link received, opening it")
                 _finish_email_confirmation(page, confirmation_url, password=password)
+                _progress("Completing Calendly onboarding")
                 _complete_onboarding(page)
 
                 cookie_file = _save_cookies(context, account_name)
-                _write_log(f"Registration successful for {order.email}")
+                _progress(f"Registration successful for {order.email}")
                 return RegistrationResult(
                     account_name=account_name,
                     login_email=order.email,
@@ -486,7 +510,7 @@ def register_calendly_account(account_name: str, ads_profile_id: str) -> Registr
 
         except (CaptchaSolveError, AnyMessageApiError, ProxyRotationError, PlaywrightTimeoutError) as exc:
             last_error = exc
-            _write_log(f"Registration recoverable error on attempt={attempt}: {exc}")
+            _progress(f"Recoverable registration error on attempt {attempt}: {exc}")
             if attempt < REGISTRATION_MAX_ATTEMPTS:
                 proxy_client.rotate()
                 time.sleep(2)
@@ -494,7 +518,7 @@ def register_calendly_account(account_name: str, ads_profile_id: str) -> Registr
             break
         except Exception as exc:  # noqa: BLE001
             last_error = exc
-            _write_log(f"Registration fatal error on attempt={attempt}: {exc}")
+            _progress(f"Fatal registration error on attempt {attempt}: {exc}")
             if attempt < REGISTRATION_MAX_ATTEMPTS:
                 proxy_client.rotate()
                 time.sleep(2)
