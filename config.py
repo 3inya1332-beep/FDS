@@ -38,8 +38,8 @@ CAPTCHA_MODE = "manual"  # manual | auto_wait
 CAPTCHA_MANUAL_TIMEOUT_SECONDS = 600
 
 # Runtime speed multiplier for explicit UI pauses.
-# 1.0 = original speed, 0.5 = ~2x faster.
-ACTION_SPEED_MULTIPLIER = 0.5
+# 1.0 = original speed, 0.5 = ~2x faster, 0.25 = ~4x faster.
+ACTION_SPEED_MULTIPLIER = 0.25
 
 # Booking settings.
 BOOKING_GUESTS_PER_EVENT = 10

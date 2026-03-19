@@ -93,6 +93,27 @@ def _pause(page: Page, milliseconds: int) -> None:
     page.wait_for_timeout(_scaled_ms(milliseconds))
 
 
+def _maximize_ads_window(browser: Browser, page: Page) -> None:
+    # Try real browser window maximize first (works on many Chromium+CDP setups).
+    try:
+        browser_cdp = browser.new_browser_cdp_session()
+        info = browser_cdp.send("Browser.getWindowForTarget")
+        window_id = info.get("windowId")
+        if window_id:
+            browser_cdp.send(
+                "Browser.setWindowBounds",
+                {"windowId": window_id, "bounds": {"windowState": "maximized"}},
+            )
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Fallback to large viewport.
+    try:
+        page.set_viewport_size({"width": 1920, "height": 1080})
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _resolve_or_create_dir(candidates: list[Path]) -> Path:
     for folder in candidates:
         if folder.exists():
@@ -216,8 +237,9 @@ def open_ads_page(ads_profile_id: str) -> Iterable[tuple[Page, BrowserContext]]:
             context = browser.contexts[0] if browser.contexts else browser.new_context()
             # Always use a fresh tab for deterministic automation.
             page = context.new_page()
-            page.set_default_timeout(20_000)
-            page.set_default_navigation_timeout(90_000)
+            _maximize_ads_window(browser, page)
+            page.set_default_timeout(12_000)
+            page.set_default_navigation_timeout(60_000)
             page.bring_to_front()
             try:
                 page.goto("about:blank", wait_until="domcontentloaded", timeout=20_000)
@@ -458,7 +480,7 @@ def _finish_email_confirmation(page: Page, confirmation_url: str, password: str)
 def _choose_random_option(page: Page, labels: list[str]) -> bool:
     random.shuffle(labels)
     for label in labels:
-        button = page.get_by_role("button", name=re.compile(rf"^{re.escape(label)}$", re.I)).first
+        button = page.get_by_role("button", name=re.compile(re.escape(label), re.I)).first
         try:
             button.wait_for(state="visible", timeout=3_000)
             button.click()
@@ -466,6 +488,62 @@ def _choose_random_option(page: Page, labels: list[str]) -> bool:
         except Exception:  # noqa: BLE001
             continue
     return False
+
+
+def _click_label_option(page: Page, label: str) -> bool:
+    selectors = [
+        f"button:has-text('{label}')",
+        f"[role='button']:has-text('{label}')",
+        f"label:has-text('{label}')",
+        f"div:has-text('{label}')",
+    ]
+    for selector in selectors:
+        locator = page.locator(selector).first
+        try:
+            locator.wait_for(state="visible", timeout=2_500)
+            locator.scroll_into_view_if_needed()
+            try:
+                locator.click(timeout=2_500)
+            except Exception:  # noqa: BLE001
+                locator.click(timeout=2_500, force=True)
+            return True
+        except Exception:  # noqa: BLE001
+            continue
+
+    # Additional fallback by plain text node.
+    text_node = page.get_by_text(re.compile(re.escape(label), re.I)).first
+    try:
+        text_node.wait_for(state="visible", timeout=2_000)
+        text_node.click()
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _choose_random_labels(page: Page, labels: list[str], min_clicks: int = 1, max_clicks: int = 1) -> int:
+    shuffled = labels[:]
+    random.shuffle(shuffled)
+    target_clicks = min(len(shuffled), max(min_clicks, random.randint(min_clicks, max_clicks)))
+    clicked = 0
+    for label in shuffled:
+        if clicked >= target_clicks:
+            break
+        if _click_label_option(page, label):
+            clicked += 1
+            _pause(page, 120)
+    return clicked
+
+
+def _click_next_until_progress(page: Page, retries: int = 4) -> bool:
+    before = page.url
+    for _ in range(retries):
+        if _safe_click_next(page):
+            _pause(page, 350)
+            if page.url != before:
+                return True
+        else:
+            _pause(page, 200)
+    return page.url != before
 
 
 def _configure_weekly_hours(page: Page) -> None:
@@ -498,48 +576,73 @@ def _configure_weekly_hours(page: Page) -> None:
 
 
 def _complete_onboarding(page: Page) -> None:
-    _pause(page, 800)
+    _progress("Onboarding flow started.")
+    for _ in range(14):
+        if "/app/scheduling/meeting_types/" in page.url:
+            _progress("Onboarding completed.")
+            return
 
-    _choose_random_option(page, ["On my own", "With my team"])
-    _choose_random_option(
-        page,
-        [
-            "Meet with multiple attendees",
-            "Schedule meetings",
-            "Collect payment",
-            "Automate pre/post meeting emails",
-            "Record and transcribe meetings",
-            "Manage contact records",
-        ],
-    )
-    _safe_click_next(page)
-    _pause(page, 500)
+        if "accounts.google.com" in page.url:
+            _progress("Google auth page detected, going back.")
+            page.go_back(wait_until="domcontentloaded")
+            _pause(page, 250)
+            _click_next_until_progress(page, retries=2)
+            continue
 
-    _choose_random_option(
-        page,
-        ["Finance", "Sales", "Customer success", "Recruiting", "Marketing", "Education", "Consulting", "Other"],
-    )
-    _safe_click_next(page)
-    _pause(page, 500)
+        if page.locator("text=/How do you plan on using Calendly/i").count() > 0 or "/app/intro/team" in page.url:
+            _progress("Selecting random options on team/use page.")
+            top_clicked = _choose_random_labels(page, ["On my own", "With my team"], min_clicks=1, max_clicks=1)
+            help_clicked = _choose_random_labels(
+                page,
+                [
+                    "Meet with multiple attendees",
+                    "Schedule meetings",
+                    "Collect payment",
+                    "Automate pre/post meeting emails",
+                    "Record and transcribe meetings",
+                    "Manage contact records",
+                ],
+                min_clicks=1,
+                max_clicks=2,
+            )
+            if top_clicked == 0 or help_clicked == 0:
+                raise CalendlyAutomationError("Could not select onboarding options on /app/intro/team")
+            _click_next_until_progress(page)
+            continue
 
-    # Calendar connection page: click Next, if redirected to Google auth - go back.
-    _safe_click_next(page)
-    _pause(page, 700)
-    if "accounts.google.com" in page.url:
-        page.go_back(wait_until="domcontentloaded")
-        _pause(page, 400)
+        if page.locator("text=/What is your role\\?/i").count() > 0 or "/app/intro/role" in page.url:
+            _progress("Selecting random role.")
+            role_clicked = _choose_random_labels(
+                page,
+                ["Finance", "Sales", "Customer success", "Recruiting", "Marketing", "Education", "Consulting", "Other"],
+                min_clicks=1,
+                max_clicks=1,
+            )
+            if role_clicked == 0:
+                raise CalendlyAutomationError("Could not select role on onboarding page.")
+            _click_next_until_progress(page)
+            continue
+
+        if (
+            page.locator("text=/Set up how your Google calendar will be used/i").count() > 0
+            or page.locator("text=/Google calendar/i").count() > 0
+        ):
+            _progress("Calendar connect step detected, skipping via Next.")
+            _click_next_until_progress(page, retries=3)
+            continue
+
+        if page.locator("text=/When are you available to meet with people/i").count() > 0:
+            _progress("Configuring weekly hours.")
+            _configure_weekly_hours(page)
+            _click_next_until_progress(page, retries=4)
+            continue
+
+        # Generic fallback for other intro steps.
         _safe_click_next(page)
+        _pause(page, 250)
 
-    _pause(page, 700)
-    _configure_weekly_hours(page)
-    _safe_click_next(page)
-    _pause(page, 400)
-    _safe_click_next(page)
-
-    try:
-        page.wait_for_url("**/app/scheduling/meeting_types/**", timeout=90_000)
-    except Exception:  # noqa: BLE001
-        page.goto(CALENDLY_MEETING_TYPES_URL, wait_until="domcontentloaded", timeout=90_000)
+    _progress("Onboarding did not auto-finish in time, opening meeting types URL directly.")
+    page.goto(CALENDLY_MEETING_TYPES_URL, wait_until="domcontentloaded", timeout=90_000)
 
 
 def _wait_confirmation_with_captcha_support(

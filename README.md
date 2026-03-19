@@ -33,7 +33,7 @@ playwright install chromium
   - `CAPTCHA_MODE = "manual"` — вручную решаете капчу в ADS и нажимаете Enter в консоли
   - `CAPTCHA_MANUAL_TIMEOUT_SECONDS` — сколько ждать ручного решения
 - скорость действий:
-  - `ACTION_SPEED_MULTIPLIER = 0.5` — ускорение явных пауз примерно в 2 раза
+  - `ACTION_SPEED_MULTIPLIER = 0.25` — ускорение явных пауз примерно в 4 раза (максимально быстро)
 
 Также можно передать ADS ключ через переменную окружения:
 
