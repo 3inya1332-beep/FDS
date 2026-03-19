@@ -34,6 +34,8 @@ NINEPROXY_PORT = ""
 # Retry strategy for registration when captcha/proxy errors happen.
 REGISTRATION_MAX_ATTEMPTS = 3
 CAPTCHA_WAIT_SECONDS = 20
+CAPTCHA_MODE = "manual"  # manual | auto_wait
+CAPTCHA_MANUAL_TIMEOUT_SECONDS = 600
 
 # Booking settings.
 BOOKING_GUESTS_PER_EVENT = 10

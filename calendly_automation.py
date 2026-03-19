@@ -5,6 +5,7 @@ import random
 import re
 import secrets
 import string
+import sys
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -30,6 +31,8 @@ from config import (
     BOOKING_NAME_PREFIX,
     CALENDLY_MEETING_TYPES_URL,
     CALENDLY_SIGNUP_URL,
+    CAPTCHA_MANUAL_TIMEOUT_SECONDS,
+    CAPTCHA_MODE,
     CAPTCHA_WAIT_SECONDS,
     COOKIE_DIR_CANDIDATES,
     EDIT_DIR_CANDIDATES,
@@ -244,22 +247,65 @@ def _wait_for_possible_captcha(page: Page) -> None:
         "iframe[src*='captcha']",
         "iframe[src*='recaptcha']",
         "iframe[src*='hcaptcha']",
+        "iframe[title*='captcha' i]",
         "text=/verify.*human/i",
+        "text=/i am not a robot/i",
     ]
-    detected = False
-    for selector in captcha_selectors:
-        if page.locator(selector).count() > 0:
-            detected = True
-            break
-    if not detected:
+
+    def captcha_is_visible() -> bool:
+        for selector in captcha_selectors:
+            locator = page.locator(selector).first
+            try:
+                if locator.count() > 0 and locator.is_visible():
+                    return True
+            except Exception:  # noqa: BLE001
+                continue
+        return False
+
+    if not captcha_is_visible():
         return
 
-    _write_log("Captcha detected, waiting for auto/manual solve.")
-    page.wait_for_timeout(CAPTCHA_WAIT_SECONDS * 1_000)
+    _progress("Captcha detected on page.")
+    mode = (CAPTCHA_MODE or "manual").strip().lower()
+    if mode == "manual":
+        _progress(
+            "Manual captcha mode: solve captcha in ADS window, then return to console and press Enter."
+        )
+        deadline = time.time() + CAPTCHA_MANUAL_TIMEOUT_SECONDS
+        while time.time() < deadline:
+            remaining = int(deadline - time.time())
+            try:
+                if sys.stdin.isatty():
+                    input(
+                        f"[CAPTCHA] Решите капчу в ADS и нажмите Enter (осталось ~{remaining} сек)..."
+                    )
+                else:
+                    # Non-interactive terminal fallback.
+                    page.wait_for_timeout(8_000)
+            except EOFError:
+                page.wait_for_timeout(8_000)
 
-    for selector in captcha_selectors:
-        if page.locator(selector).count() > 0:
-            raise CaptchaSolveError("Captcha still present after waiting.")
+            # Try to continue flow in case submit is still pending.
+            _safe_click_next(page)
+            page.wait_for_timeout(1_500)
+
+            if not captcha_is_visible():
+                _progress("Captcha solved, continuing registration.")
+                return
+
+            # Sometimes page already moved but iframe still exists hidden elsewhere.
+            if "/signup" not in page.url.lower():
+                _progress("Signup page changed after captcha; continuing.")
+                return
+
+            _progress("Captcha still visible. Solve it and press Enter again.")
+
+        raise CaptchaSolveError("Captcha manual timeout exceeded.")
+
+    _progress("Auto captcha wait mode: waiting before re-check.")
+    page.wait_for_timeout(CAPTCHA_WAIT_SECONDS * 1_000)
+    if captcha_is_visible():
+        raise CaptchaSolveError("Captcha still present after auto wait.")
 
 
 def _safe_click_next(page: Page) -> bool:

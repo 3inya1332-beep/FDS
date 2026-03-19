@@ -29,6 +29,9 @@ playwright install chromium
 - `API_KEY` (если используется вашей версией ADS)
 - `ANYMESSAGE_TOKEN` и параметры домена/site
 - параметры `NINEPROXY_*` (если нужна аварийная смена proxy)
+- режим капчи:
+  - `CAPTCHA_MODE = "manual"` — вручную решаете капчу в ADS и нажимаете Enter в консоли
+  - `CAPTCHA_MANUAL_TIMEOUT_SECONDS` — сколько ждать ручного решения
 
 Также можно передать ADS ключ через переменную окружения:
 
