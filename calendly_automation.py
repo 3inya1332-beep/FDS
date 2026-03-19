@@ -53,6 +53,7 @@ from config import (
     EMAIL_FILENAME,
     LOGS_DIR,
     REGISTRATION_MAX_ATTEMPTS,
+    SIGNUP_INITIAL_DELAY_SECONDS,
     SIGNUP_LOAD_CHECK_TIMEOUT_SECONDS,
     SIGNUP_LOAD_MAX_RELOADS,
     SUBJECT_FILENAME,
@@ -1101,6 +1102,8 @@ def register_calendly_account(account_name: str, ads_profile_id: str) -> Registr
 
         try:
             with open_ads_page(ads_profile_id) as (page, context):
+                _progress(f"Waiting {SIGNUP_INITIAL_DELAY_SECONDS}s before opening signup page.")
+                time.sleep(max(0, int(SIGNUP_INITIAL_DELAY_SECONDS)))
                 _open_signup_page_with_recovery(page)
                 _progress("Filling signup form")
                 _fill_signup_form(page, account_name=account_name, password=password, email=order.email)

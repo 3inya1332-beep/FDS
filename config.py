@@ -17,6 +17,7 @@ CALENDLY_SIGNUP_URL = "https://calendly.com/signup"
 CALENDLY_MEETING_TYPES_URL = "https://calendly.com/app/scheduling/meeting_types/user/me"
 SIGNUP_LOAD_CHECK_TIMEOUT_SECONDS = 8
 SIGNUP_LOAD_MAX_RELOADS = 4
+SIGNUP_INITIAL_DELAY_SECONDS = 4
 
 # AnyMessage email activation API.
 # Docs reference: https://anymessage.shop/en/docs
