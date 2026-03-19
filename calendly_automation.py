@@ -683,6 +683,7 @@ def run_booking_sender(
     email_pool = load_email_pool()
     if not email_pool:
         raise CalendlyAutomationError("Email list is empty.")
+    total_input = len(email_pool)
 
     fallback_url = (fallback_booking_url or profile.booking_url or "").strip()
     if not date_page_url and not fallback_url:
@@ -735,7 +736,7 @@ def run_booking_sender(
         _write_log(f"Updated cookie file after booking: {cookie_file}")
 
     return SendStats(
-        total_input_emails=consumed,
+        total_input_emails=total_input,
         scheduled_events=scheduled,
         consumed_emails=consumed,
         remaining_emails=len(email_pool),
