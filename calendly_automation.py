@@ -1463,7 +1463,42 @@ def _is_booking_form_visible(page: Page) -> bool:
     return has_name and has_email
 
 
+def _count_visible_time_buttons(page: Page) -> int:
+    try:
+        buttons = page.locator("button")
+        count = buttons.count()
+    except Exception:  # noqa: BLE001
+        return 0
+
+    matched = 0
+    for idx in range(min(count, 200)):
+        btn = buttons.nth(idx)
+        try:
+            if not btn.is_visible():
+                continue
+            text = (btn.text_content() or "").strip().lower()
+            if re.fullmatch(r"\d{1,2}:\d{2}\s?(am|pm)", text):
+                matched += 1
+        except Exception:  # noqa: BLE001
+            continue
+    return matched
+
+
+def _wait_booking_calendar_ready(page: Page, timeout_seconds: int = 12) -> None:
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        if _is_booking_form_visible(page):
+            return
+        if _count_visible_time_buttons(page) > 0:
+            return
+        if _count_clickable_date_buttons(page) > 0:
+            return
+        _pause(page, 120)
+
+
 def _click_first_time_button(page: Page) -> bool:
+    visible_before = _count_visible_time_buttons(page)
+    _progress(f"Visible time buttons: {visible_before}")
     try:
         clicked = page.evaluate(
             """
@@ -1494,7 +1529,38 @@ def _click_first_time_button(page: Page) -> bool:
     return False
 
 
+def _count_clickable_date_buttons(page: Page) -> int:
+    try:
+        return int(
+            page.evaluate(
+                """
+                () => {
+                  const buttons = Array.from(document.querySelectorAll('button'));
+                  let matched = 0;
+                  for (const btn of buttons) {
+                    const txt = (btn.textContent || '').trim();
+                    if (!/^\\d{1,2}$/.test(txt)) continue;
+                    if (btn.disabled || btn.getAttribute('aria-disabled') === 'true') continue;
+                    const aria = (btn.getAttribute('aria-label') || '').toLowerCase();
+                    if (aria.includes('unavailable')) continue;
+                    const r = btn.getBoundingClientRect();
+                    const s = window.getComputedStyle(btn);
+                    if (r.width < 18 || r.height < 18) continue;
+                    if (s.display === 'none' || s.visibility === 'hidden') continue;
+                    matched += 1;
+                  }
+                  return matched;
+                }
+                """
+            )
+        )
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 def _click_first_available_date(page: Page) -> bool:
+    clickable_count = _count_clickable_date_buttons(page)
+    _progress(f"Clickable day buttons: {clickable_count}")
     try:
         clicked = page.evaluate(
             """
@@ -1504,6 +1570,8 @@ def _click_first_available_date(page: Page) -> bool:
                 const txt = (btn.textContent || '').trim();
                 if (!/^\\d{1,2}$/.test(txt)) continue; // only day circles
                 if (btn.disabled || btn.getAttribute('aria-disabled') === 'true') continue;
+                const aria = (btn.getAttribute('aria-label') || '').toLowerCase();
+                if (aria.includes('unavailable')) continue;
                 const r = btn.getBoundingClientRect();
                 const s = window.getComputedStyle(btn);
                 if (r.width < 18 || r.height < 18) continue;
@@ -1543,6 +1611,8 @@ def _select_first_available_time(page: Page, max_months_ahead: int = 6) -> bool:
     """
     if _is_booking_form_visible(page):
         return True
+
+    _wait_booking_calendar_ready(page, timeout_seconds=12)
 
     # Try current month first, then switch months.
     for month_idx in range(max_months_ahead + 1):
@@ -1764,9 +1834,18 @@ def run_booking_sender(
             _safe_goto_calendly(page, target_booking_url, timeout_ms=60_000)
             _pause(page, 250)
             _dismiss_cookie_banner(page)
+            _wait_booking_calendar_ready(page, timeout_seconds=12)
 
             _progress("Selecting first available date and time.")
-            if not _select_first_available_time(page):
+            slot_selected = False
+            for slot_attempt in range(1, 4):
+                if _select_first_available_time(page):
+                    slot_selected = True
+                    break
+                _progress(f"Slot attempt {slot_attempt}/3 failed, waiting and retrying.")
+                _pause(page, 500)
+
+            if not slot_selected:
                 _progress("No available slots found now. Sender stopped without error.")
                 break
 
