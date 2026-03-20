@@ -36,10 +36,10 @@ class InflowAutomationError(RuntimeError):
 
 @dataclass
 class RunStats:
-    total_emails: int
-    total_orders: int
-    sent_orders: int
-    failed_orders: int
+    total_input_emails: int
+    processable_emails: int
+    sent_emails: int
+    failed_emails: int
     skipped_emails: int
     last_error: str | None
 
@@ -272,6 +272,17 @@ class InflowUi:
             return None
 
     def has_send_dialog_open(self) -> bool:
+        quick_fields = [
+            self.page.get_by_placeholder(re.compile(r"enter\s*to\s*email", re.I)),
+            self.page.get_by_placeholder(re.compile(r"enter\s*cc\s*email", re.I)),
+            self.page.get_by_placeholder(re.compile(r"enter\s*bcc\s*email", re.I)),
+        ]
+        for field in quick_fields:
+            try:
+                if field.count() > 0 and field.first.is_visible():
+                    return True
+            except Exception:  # noqa: BLE001
+                continue
         return self._visible_dialog_or_none() is not None
 
     def open_purchase_order_modal(self) -> Locator:
@@ -279,23 +290,34 @@ class InflowUi:
         if already_open is not None:
             _write_log("Send modal already open, skip Email click.")
             return already_open
+        if self.has_send_dialog_open():
+            _write_log("Send modal detected by placeholders, skip Email click.")
+            return self.page.locator("body").first
 
         last_error: Exception | None = None
-        # Click Email only once, and if modal didn't open in 20s - click one more time.
+        # Fast open flow: avoid long waits between retries.
         for attempt in range(2):
             try:
-                self.wait_until_ready(timeout_ms=25_000)
+                self.wait_until_ready(timeout_ms=8_000)
                 self._click_first_available(self._email_button_candidates(), "кнопка Email")
                 self._click_first_available(self._purchase_order_candidates(), "пункт Purchase order")
-                return self._visible_dialog(timeout_ms=20_000)
+                for _ in range(24):
+                    opened = self._visible_dialog_or_none()
+                    if opened is not None or self.has_send_dialog_open():
+                        return opened if opened is not None else self.page.locator("body").first
+                    self.page.wait_for_timeout(250)
+                last_error = InflowAutomationError("Окно не появилось после выбора Purchase order.")
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
                 existing = self._visible_dialog_or_none()
                 if existing is not None:
                     _write_log("Send modal became visible after click failure, continue.")
                     return existing
+                if self.has_send_dialog_open():
+                    _write_log("Send modal detected after click failure, continue.")
+                    return self.page.locator("body").first
                 if attempt == 0:
-                    self.page.wait_for_timeout(20_000)
+                    self.page.wait_for_timeout(1_000)
         raise InflowAutomationError(f"Не удалось открыть окно Purchase order: {last_error}")
 
     def _type_into_field(self, field: Locator, value: str, *, confirm_with_enter: bool) -> None:
@@ -332,7 +354,7 @@ class InflowUi:
             self.page.keyboard.press("Enter")
             self.page.wait_for_timeout(200)
 
-    def _first_visible_field(self, candidates: list[Locator], timeout_ms: int = 2_000) -> Locator | None:
+    def _first_visible_field(self, candidates: list[Locator], timeout_ms: int = 350) -> Locator | None:
         for locator in candidates:
             try:
                 if locator.count() == 0:
@@ -499,8 +521,8 @@ def run_job(profile: Profile) -> RunStats:
 
     ads_client = AdsApiClient()
     ads_session = None
-    sent_orders = 0
-    failed_orders = 0
+    sent_emails = 0
+    failed_emails = 0
     skipped_emails = len(emails) - len(triplets) * 3
     last_error: str | None = None
     fatal_error = False
@@ -528,7 +550,7 @@ def run_job(profile: Profile) -> RunStats:
 
             for to_email, cc_email, bcc_email in triplets:
                 sent_current = False
-                for attempt in range(3):
+                for attempt in range(2):
                     try:
                         ui.send_purchase_order(
                             to_email=to_email,
@@ -537,7 +559,7 @@ def run_job(profile: Profile) -> RunStats:
                             subject=subject,
                             message=message,
                         )
-                        sent_orders += 1
+                        sent_emails += 3
                         sent_current = True
                         _write_log(f"Order sent: TO={to_email}, CC={cc_email}, BCC={bcc_email}")
                         break
@@ -551,13 +573,13 @@ def run_job(profile: Profile) -> RunStats:
                         try:
                             ui.maximize_window()
                             if not ui.has_send_dialog_open():
-                                ui.wait_until_ready(timeout_ms=12_000)
+                                ui.wait_until_ready(timeout_ms=4_000)
                         except Exception as heal_exc:  # noqa: BLE001
                             _write_log(f"Recovery wait failed: {heal_exc}")
-                        self_heal_delay = 1.5 + attempt
+                        self_heal_delay = 0.7 + attempt * 0.3
                         time.sleep(self_heal_delay)
                 if not sent_current:
-                    failed_orders += 1
+                    failed_emails += 3
                 time.sleep(SEND_DELAY_SECONDS)
     except AdsApiError:
         raise
@@ -566,20 +588,20 @@ def run_job(profile: Profile) -> RunStats:
         last_error = str(exc)
         raise InflowAutomationError(str(exc)) from exc
     finally:
-        if ads_session is not None and not (fatal_error or failed_orders > 0):
+        if ads_session is not None and not (fatal_error or failed_emails > 0):
             ads_client.stop_browser(ads_session.profile_id)
         elif ads_session is not None:
             _write_log("Browser left open because there were automation errors.")
         _write_log(
             f"Job finished: total_emails={len(emails)}, total_orders={len(triplets)}, "
-            f"sent_orders={sent_orders}, failed_orders={failed_orders}, skipped={skipped_emails}"
+            f"sent_emails={sent_emails}, failed_emails={failed_emails}, skipped={skipped_emails}"
         )
 
     return RunStats(
-        total_emails=len(emails),
-        total_orders=len(triplets),
-        sent_orders=sent_orders,
-        failed_orders=failed_orders,
+        total_input_emails=len(emails),
+        processable_emails=len(triplets) * 3,
+        sent_emails=sent_emails,
+        failed_emails=failed_emails,
         skipped_emails=skipped_emails,
         last_error=last_error,
     )

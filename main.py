@@ -87,10 +87,10 @@ def run_flow(store: ProfileStore) -> None:
     try:
         stats = run_job(profile)
         print("\nГотово:")
-        print(f"  Всего email: {stats.total_emails}")
-        print(f"  Всего отправок (по 3 email): {stats.total_orders}")
-        print(f"  Успешных отправок: {stats.sent_orders}")
-        print(f"  Ошибочных отправок: {stats.failed_orders}")
+        print(f"  Всего email во входном файле: {stats.total_input_emails}")
+        print(f"  Email к обработке (кратно 3): {stats.processable_emails}")
+        print(f"  Успешных отправок email: {stats.sent_emails}")
+        print(f"  Ошибочных отправок email: {stats.failed_emails}")
         print(f"  Пропущено email (остаток < 3): {stats.skipped_emails}")
         if stats.last_error:
             print(f"  Последняя ошибка: {stats.last_error}")
