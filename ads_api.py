@@ -174,6 +174,34 @@ class AdsApiClient:
         return payload
 
     @staticmethod
+    def _extract_profile_id(data: dict[str, Any]) -> str | None:
+        direct_candidates = [
+            data.get("id"),
+            data.get("user_id"),
+            data.get("profile_id"),
+            data.get("serial_number"),
+            data.get("uid"),
+            data.get("data"),
+        ]
+        for candidate in direct_candidates:
+            if candidate is None:
+                continue
+            value = str(candidate).strip()
+            if value:
+                return value
+
+        list_candidates = data.get("user_ids") or data.get("profile_ids") or data.get("ids")
+        if isinstance(list_candidates, list) and list_candidates:
+            first = str(list_candidates[0]).strip()
+            if first:
+                return first
+
+        nested_list = data.get("list")
+        if isinstance(nested_list, list) and nested_list and isinstance(nested_list[0], dict):
+            return AdsApiClient._extract_profile_id(nested_list[0])
+        return None
+
+    @staticmethod
     def _is_success(payload: dict[str, Any]) -> bool:
         if "code" in payload:
             return str(payload.get("code")) in {"0", "200"} or payload.get("code") is None
@@ -250,3 +278,143 @@ class AdsApiClient:
                 return
             except Exception:  # noqa: BLE001
                 continue
+
+    def create_profile_with_socks5(
+        self,
+        *,
+        profile_name: str,
+        proxy_host: str,
+        proxy_port: int,
+        proxy_user: str = "",
+        proxy_password: str = "",
+    ) -> str:
+        profile_name = profile_name.strip()
+        proxy_host = proxy_host.strip()
+        port_value = str(proxy_port).strip()
+        if not profile_name:
+            raise AdsApiError("Profile name is required for ADS profile creation.")
+        if not proxy_host or not port_value:
+            raise AdsApiError("Proxy host/port are required for ADS profile creation.")
+
+        create_variants: list[tuple[str, str, dict[str, Any]]] = [
+            (
+                "POST",
+                "/api/v1/user/create",
+                {
+                    "name": profile_name,
+                    "group_id": "0",
+                    "proxy_method": 2,
+                    "proxy_type": "socks5",
+                    "proxy_host": proxy_host,
+                    "proxy_port": port_value,
+                    "proxy_user": proxy_user,
+                    "proxy_password": proxy_password,
+                },
+            ),
+            (
+                "POST",
+                "/api/v1/user/create",
+                {
+                    "name": profile_name,
+                    "group_id": "0",
+                    "user_proxy_config": {
+                        "proxy_soft": "other",
+                        "proxy_type": "socks5",
+                        "proxy_host": proxy_host,
+                        "proxy_port": port_value,
+                        "proxy_user": proxy_user,
+                        "proxy_password": proxy_password,
+                    },
+                    "fingerprint_config": {},
+                },
+            ),
+            (
+                "POST",
+                "/api/v1/user/add",
+                {
+                    "name": profile_name,
+                    "group_id": "0",
+                    "user_proxy_config": {
+                        "proxy_soft": "other",
+                        "proxy_type": "socks5",
+                        "proxy_host": proxy_host,
+                        "proxy_port": port_value,
+                        "proxy_user": proxy_user,
+                        "proxy_password": proxy_password,
+                    },
+                    "fingerprint_config": {},
+                },
+            ),
+            (
+                "POST",
+                "/api/v1/profile/create",
+                {
+                    "name": profile_name,
+                    "proxy": {
+                        "type": "socks5",
+                        "host": proxy_host,
+                        "port": port_value,
+                        "username": proxy_user,
+                        "password": proxy_password,
+                    },
+                },
+            ),
+        ]
+
+        errors: list[str] = []
+        for method, path, payload in create_variants:
+            try:
+                response_payload = self._request_with_auth_fallback(
+                    method=method,
+                    path=path,
+                    json_payload=payload,
+                )
+                if not self._is_success(response_payload):
+                    errors.append(f"{path}: {response_payload}")
+                    time.sleep(0.2)
+                    continue
+                data = self._data_from_payload(response_payload)
+                profile_id = self._extract_profile_id(data)
+                if profile_id:
+                    return profile_id
+                errors.append(f"{path}: profile id not found in response {response_payload}")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{path}: {exc}")
+            time.sleep(0.2)
+
+        raise AdsApiError("Unable to create ADS profile with socks5 proxy. " + " | ".join(errors))
+
+    def delete_profile(self, profile_id: str) -> bool:
+        profile_id = profile_id.strip()
+        if not profile_id:
+            return False
+
+        delete_variants: list[tuple[str, str, dict[str, Any] | None, dict[str, Any] | None]] = [
+            ("POST", "/api/v1/user/delete", None, {"user_ids": [profile_id]}),
+            ("POST", "/api/v1/user/delete", None, {"user_id": profile_id}),
+            ("GET", "/api/v1/user/delete", {"user_id": profile_id}, None),
+            ("GET", "/api/v1/user/delete", {"profile_id": profile_id}, None),
+            ("POST", "/api/v1/profile/delete", None, {"profile_id": profile_id}),
+            ("GET", "/api/v1/profile/delete", {"profile_id": profile_id}, None),
+        ]
+
+        errors: list[str] = []
+        for method, path, params, json_payload in delete_variants:
+            try:
+                response_payload = self._request_with_auth_fallback(
+                    method=method,
+                    path=path,
+                    params=params,
+                    json_payload=json_payload,
+                )
+                if self._is_success(response_payload):
+                    return True
+                msg = self._msg(response_payload).lower()
+                if any(token in msg for token in ("not found", "no such", "already deleted", "does not exist")):
+                    return True
+                errors.append(f"{path}: {response_payload}")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{path}: {exc}")
+            time.sleep(0.15)
+
+        raise AdsApiError("Unable to delete ADS profile. " + " | ".join(errors))

@@ -58,6 +58,12 @@ from config import (
     REGISTRATION_MAX_ATTEMPTS,
     SCHEDULE_CONFIRM_EXTRA_WAIT_SECONDS,
     SEND_BETWEEN_BOOKINGS_SECONDS,
+    SENDER_CAPTCHA_PROFILE_NAME_PREFIX,
+    SENDER_CAPTCHA_PROXY_HOST,
+    SENDER_CAPTCHA_PROXY_PASSWORD,
+    SENDER_CAPTCHA_PROXY_PORT,
+    SENDER_CAPTCHA_PROXY_TYPE,
+    SENDER_CAPTCHA_PROXY_USER,
     SENT_EMAILS_DIR,
     SENT_EMAILS_FILENAME,
     SIGNUP_INITIAL_DELAY_SECONDS,
@@ -77,6 +83,10 @@ class CalendlyAutomationError(RuntimeError):
 
 
 class CaptchaSolveError(CalendlyAutomationError):
+    pass
+
+
+class SenderCaptchaDetected(CalendlyAutomationError):
     pass
 
 
@@ -551,6 +561,39 @@ def _wait_for_possible_captcha(page: Page) -> None:
     _pause(page, CAPTCHA_WAIT_SECONDS * 1_000)
     if captcha_is_visible():
         raise CaptchaSolveError("Captcha still present after auto wait.")
+
+
+def _sender_captcha_visible(page: Page) -> bool:
+    selectors = [
+        "iframe[src*='google.com/recaptcha']",
+        "iframe[src*='recaptcha']",
+        "iframe[src*='hcaptcha']",
+        "iframe[title*='captcha' i]",
+        "div.g-recaptcha",
+        "textarea[name='g-recaptcha-response']",
+        "text=/i am not a robot/i",
+        "text=/verify you are human/i",
+        "text=/confirm you're human/i",
+        "text=/security check/i",
+        "text=/captcha/i",
+    ]
+    for selector in selectors:
+        locator = page.locator(selector).first
+        try:
+            if locator.count() > 0 and locator.is_visible():
+                return True
+        except Exception:  # noqa: BLE001
+            continue
+
+    current_url = (page.url or "").lower()
+    if "captcha" in current_url and "calendly.com" in current_url:
+        return True
+    return False
+
+
+def _raise_sender_captcha(page: Page, stage: str) -> None:
+    if _sender_captcha_visible(page):
+        raise SenderCaptchaDetected(f"Captcha detected during sender ({stage}).")
 
 
 def _safe_click_next(page: Page) -> bool:
@@ -1353,6 +1396,38 @@ def run_manual_ads_session(
         return ManualSessionResult(cookie_file=cookie_file, last_url=current_url)
 
 
+def recreate_ads_profile_after_sender_captcha(*, old_profile_id: str, profile_name: str) -> str:
+    proxy_type = (SENDER_CAPTCHA_PROXY_TYPE or "").strip().lower()
+    if proxy_type != "socks5":
+        raise CalendlyAutomationError("Only socks5 proxy type is supported for sender captcha recovery.")
+
+    ads_client = AdsApiClient()
+    _progress(f"Sender captcha recovery: stopping and deleting ADS profile {old_profile_id}")
+    try:
+        ads_client.stop_browser(old_profile_id)
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        ads_client.delete_profile(old_profile_id)
+        _progress(f"Old ADS profile deleted: {old_profile_id}")
+    except Exception as exc:  # noqa: BLE001
+        _progress(f"Old ADS profile delete warning: {exc}")
+
+    new_profile_name = (
+        f"{SENDER_CAPTCHA_PROFILE_NAME_PREFIX}-{_slugify(profile_name)}-{int(time.time())}"
+    )
+    new_profile_id = ads_client.create_profile_with_socks5(
+        profile_name=new_profile_name,
+        proxy_host=SENDER_CAPTCHA_PROXY_HOST,
+        proxy_port=int(SENDER_CAPTCHA_PROXY_PORT),
+        proxy_user=SENDER_CAPTCHA_PROXY_USER,
+        proxy_password=SENDER_CAPTCHA_PROXY_PASSWORD,
+    )
+    _progress(f"New ADS profile created for sender recovery: {new_profile_id}")
+    return new_profile_id
+
+
 def _dismiss_cookie_banner(page: Page) -> None:
     _click_first(
         page,
@@ -1579,6 +1654,7 @@ def _count_visible_time_buttons(page: Page) -> int:
 def _wait_booking_calendar_ready(page: Page, timeout_seconds: int = 12) -> None:
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
+        _raise_sender_captcha(page, "calendar loading")
         if _is_booking_form_visible(page):
             return
         if _count_visible_time_buttons(page) > 0:
@@ -1708,6 +1784,7 @@ def _select_first_available_time(page: Page, max_months_ahead: int = 6) -> bool:
 
     # Try current month first, then switch months.
     for month_idx in range(max_months_ahead + 1):
+        _raise_sender_captcha(page, f"month scan {month_idx}")
         if _click_first_time_button(page):
             if _is_booking_form_visible(page):
                 return True
@@ -1729,6 +1806,7 @@ def _select_first_available_time(page: Page, max_months_ahead: int = 6) -> bool:
 
 def _fill_booking_form(page: Page, invitee_name: str, invitee_email: str, guest_emails: list[str]) -> None:
     _progress("Filling Enter Details form.")
+    _raise_sender_captcha(page, "booking form opened")
 
     # Try strict selectors first.
     name_filled = _fill_first(
@@ -1843,6 +1921,7 @@ def _fill_booking_form(page: Page, invitee_name: str, invitee_email: str, guest_
             email_filled = False
     if not email_filled:
         raise CalendlyAutomationError("Invitee Email input not found.")
+    _raise_sender_captcha(page, "booking form filled")
 
     if guest_emails:
         _progress(f"Adding guests: {len(guest_emails)}")
@@ -1891,13 +1970,17 @@ def _fill_booking_form(page: Page, invitee_name: str, invitee_email: str, guest_
         ],
         timeout=10_000,
     ):
+        _raise_sender_captcha(page, "before schedule click")
         raise CalendlyAutomationError("Schedule button not found.")
 
     _progress("Waiting booking confirmation.")
     try:
+        _raise_sender_captcha(page, "after schedule click")
         page.wait_for_selector("text=/scheduled|confirmed|you are scheduled/i", timeout=25_000)
         time.sleep(max(0, SCHEDULE_CONFIRM_EXTRA_WAIT_SECONDS))
+        _raise_sender_captcha(page, "waiting confirmation")
     except Exception as exc:  # noqa: BLE001
+        _raise_sender_captcha(page, "confirmation wait failed")
         raise CalendlyAutomationError("Booking confirmation was not detected.") from exc
 
 
@@ -1934,14 +2017,18 @@ def run_booking_sender(
             _safe_goto_calendly(page, target_booking_url, timeout_ms=60_000)
             _pause(page, 250)
             _dismiss_cookie_banner(page)
+            _raise_sender_captcha(page, "booking page opened")
             _wait_booking_calendar_ready(page, timeout_seconds=12)
+            _raise_sender_captcha(page, "calendar ready")
 
             _progress("Selecting first available date and time.")
             slot_selected = False
             for slot_attempt in range(1, 4):
+                _raise_sender_captcha(page, f"slot attempt {slot_attempt} start")
                 if _select_first_available_time(page):
                     slot_selected = True
                     break
+                _raise_sender_captcha(page, f"slot attempt {slot_attempt} failed")
                 _progress(f"Slot attempt {slot_attempt}/3 failed, waiting and retrying.")
                 _pause(page, 500)
 
