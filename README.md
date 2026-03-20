@@ -68,6 +68,10 @@ pip install -r requirements.txt
 python main.py
 ```
 
+### Быстрый запуск на Windows
+
+Можно просто запустить файл `run_main.bat` (двойной клик), без ручного `cd ...`.
+
 В меню:
 
 1. Добавьте профиль ADS (введите `ADS profile id` и URL).

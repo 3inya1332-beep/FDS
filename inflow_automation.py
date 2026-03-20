@@ -276,7 +276,7 @@ def _random_uk_phone(digits: int = UK_PHONE_DIGITS) -> str:
 class InflowUi:
     def __init__(self, page: Page) -> None:
         self.page = page
-        self._f11_used = False
+        self._window_maximized_once = False
 
     def _email_button_candidates(self) -> list[Locator]:
         return [
@@ -316,64 +316,53 @@ class InflowUi:
         ]
 
     def maximize_window(self) -> None:
+        # Do not spam fullscreen hotkeys (F11 can toggle and "shake" UI).
+        # Keep this method idempotent and non-intrusive.
+        if self._window_maximized_once:
+            try:
+                self.page.set_viewport_size({"width": 1920, "height": 1080})
+            except Exception:  # noqa: BLE001
+                pass
+            return
+
         try:
             self.page.bring_to_front()
         except Exception:  # noqa: BLE001
             pass
 
-        # Try all known strategies in sequence; this improves stability across ADS builds/OS.
-        for _ in range(2):
-            try:
-                cdp = self.page.context.new_cdp_session(self.page)
-                window_info = cdp.send("Browser.getWindowForTarget")
-                window_id = window_info.get("windowId")
-                if isinstance(window_id, int):
-                    for state in ("fullscreen", "maximized", "normal"):
-                        bounds = {"windowState": state}
-                        if state == "normal":
-                            bounds = {"left": 0, "top": 0, "width": 1920, "height": 1080}
-                        try:
-                            cdp.send("Browser.setWindowBounds", {"windowId": window_id, "bounds": bounds})
-                            self.page.wait_for_timeout(120)
-                        except Exception:  # noqa: BLE001
-                            continue
-            except Exception:  # noqa: BLE001
-                pass
-
-            if not self._f11_used:
+        # Prefer native window maximize via CDP.
+        try:
+            cdp = self.page.context.new_cdp_session(self.page)
+            window_info = cdp.send("Browser.getWindowForTarget")
+            window_id = window_info.get("windowId")
+            if isinstance(window_id, int):
                 try:
-                    self.page.keyboard.press("F11")
-                    self.page.wait_for_timeout(180)
-                    self._f11_used = True
+                    cdp.send("Browser.setWindowBounds", {"windowId": window_id, "bounds": {"windowState": "maximized"}})
                 except Exception:  # noqa: BLE001
-                    pass
+                    cdp.send(
+                        "Browser.setWindowBounds",
+                        {"windowId": window_id, "bounds": {"left": 0, "top": 0, "width": 1920, "height": 1080}},
+                    )
+        except Exception:  # noqa: BLE001
+            pass
 
-            # Additional full-screen shortcuts for some window managers.
-            for shortcut in ("Control+Shift+F", "Meta+Control+F", "Alt+Enter"):
-                try:
-                    self.page.keyboard.press(shortcut)
-                    self.page.wait_for_timeout(80)
-                except Exception:  # noqa: BLE001
-                    continue
+        try:
+            self.page.set_viewport_size({"width": 1920, "height": 1080})
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.page.evaluate(
+                "() => {"
+                "  try {"
+                "    window.moveTo(0, 0);"
+                "    window.resizeTo(screen.availWidth, screen.availHeight);"
+                "  } catch (e) {}"
+                "}"
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
-            try:
-                self.page.set_viewport_size({"width": 1920, "height": 1080})
-            except Exception:  # noqa: BLE001
-                pass
-            try:
-                self.page.evaluate(
-                    "() => {"
-                    "  try {"
-                    "    window.moveTo(0, 0);"
-                    "    window.resizeTo(screen.availWidth, screen.availHeight);"
-                    "    if (document.documentElement && document.documentElement.requestFullscreen) {"
-                    "      document.documentElement.requestFullscreen().catch(() => {});"
-                    "    }"
-                    "  } catch (e) {}"
-                    "}"
-                )
-            except Exception:  # noqa: BLE001
-                pass
+        self._window_maximized_once = True
 
     def wait_until_ready(self, timeout_ms: int = 60_000) -> None:
         deadline = time.time() + (timeout_ms / 1000)
@@ -806,19 +795,74 @@ class InflowUi:
     def _signup_fill_email_and_continue(self, email: str) -> None:
         field = self._wait_signup_email_input(timeout_ms=25_000)
         self._type_into_field(field, email, confirm_with_enter=False)
-        # Try explicit button first, then Enter fallback.
-        try:
-            self._click_by_text_patterns([r"continue", r"next", r"start"], timeout_ms=6_000)
-            return
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            field.press("Enter")
-            self.page.wait_for_timeout(250)
-            return
-        except Exception:  # noqa: BLE001
-            pass
-        raise InflowAutomationError("Не удалось продолжить после ввода Work email.")
+        self.page.wait_for_timeout(300)
+
+        def _is_still_email_step() -> bool:
+            try:
+                email_input = self.page.locator("input[type='email'], input[name*='email' i], input[id*='email' i]").first
+                return email_input.count() > 0 and email_input.is_visible()
+            except Exception:  # noqa: BLE001
+                return False
+
+        button_candidates = [
+            self.page.get_by_role("button", name=re.compile(r"^continue$", re.I)),
+            self.page.locator("button[type='submit']"),
+            self.page.locator("button:has-text('Continue')"),
+            self.page.locator("input[type='submit']"),
+        ]
+
+        for attempt in range(1, 6):
+            clicked = False
+            for locator in button_candidates:
+                try:
+                    if locator.count() == 0:
+                        continue
+                    button = locator.first
+                    if not button.is_visible():
+                        continue
+                    try:
+                        if button.is_disabled():
+                            continue
+                    except Exception:  # noqa: BLE001
+                        pass
+                    button.click(timeout=3_000)
+                    clicked = True
+                    break
+                except Exception:  # noqa: BLE001
+                    continue
+
+            if not clicked:
+                try:
+                    field.press("Enter")
+                    clicked = True
+                except Exception:  # noqa: BLE001
+                    pass
+
+            if clicked:
+                self.page.wait_for_timeout(800)
+                if not _is_still_email_step():
+                    return
+
+                # Fallback JS click when UI intercepts regular click.
+                try:
+                    self.page.evaluate(
+                        "() => {"
+                        "  const btn = Array.from(document.querySelectorAll('button,input[type=\"submit\"]'))"
+                        "    .find(el => /continue/i.test((el.innerText || el.value || '').trim()));"
+                        "  if (btn) { btn.click(); }"
+                        "}"
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                self.page.wait_for_timeout(700)
+                if not _is_still_email_step():
+                    return
+
+            _write_log(f"Continue click retry on signup step: {attempt}/5")
+            self.maximize_window()
+            self.page.wait_for_timeout(450)
+
+        raise InflowAutomationError("Ввел Work email, но кнопка Continue не сработала после 5 попыток.")
 
     def _wait_url_contains(self, expected_substring: str, timeout_ms: int = 20_000) -> None:
         deadline = time.time() + (timeout_ms / 1000)
