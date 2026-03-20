@@ -44,8 +44,6 @@ from config import (
     ANYMESSAGE_POLL_SECONDS,
     BODY_FILENAME,
     BOOKING_GUESTS_PER_EVENT,
-    BOOKING_TYPING_DELAY_MAX_MS,
-    BOOKING_TYPING_DELAY_MIN_MS,
     CALENDLY_MEETING_TYPES_URL,
     CALENDLY_SIGNUP_URL,
     CAPTCHA_MANUAL_TIMEOUT_SECONDS,
@@ -67,7 +65,11 @@ from config import (
     SENDER_CAPTCHA_PROFILE_NAME_PREFIX,
     SENDER_CAPTCHA_PROXY_HOST,
     SENDER_CAPTCHA_PROXY_PASSWORD,
+    SENDER_CAPTCHA_PROXY_PING_TEST_URL,
+    SENDER_CAPTCHA_PROXY_PING_TIMEOUT_SECONDS,
+    SENDER_CAPTCHA_PROXY_ACCEPTABLE_PING_MS,
     SENDER_CAPTCHA_PROXY_PORT,
+    SENDER_CAPTCHA_PROXY_ROTATE_ATTEMPTS,
     SENDER_CAPTCHA_PROXY_ROTATE_TIMEOUT_SECONDS,
     SENDER_CAPTCHA_PROXY_ROTATE_URL,
     SENDER_CAPTCHA_PROXY_TYPE,
@@ -415,20 +417,12 @@ def _generate_real_invitee_name(used_names: set[str] | None = None) -> str:
     return candidate
 
 
-def _type_like_human(page: Page, target: Locator, value: str) -> bool:
+def _fill_fast_input(target: Locator, value: str) -> bool:
     try:
         target.click(timeout=1_500)
         target.press("Control+A")
         target.press("Delete")
-        target.type(
-            value,
-            delay=random.randint(
-                max(1, BOOKING_TYPING_DELAY_MIN_MS),
-                max(BOOKING_TYPING_DELAY_MIN_MS, BOOKING_TYPING_DELAY_MAX_MS),
-            ),
-        )
-        # Small settle delay after typing.
-        page.wait_for_timeout(random.randint(80, 180))
+        target.fill(value)
         return True
     except Exception:  # noqa: BLE001
         try:
@@ -748,50 +742,53 @@ def _try_instant_sender_captcha_click(page: Page) -> bool:
     Best-effort instant click on captcha checkbox/challenge entry point.
     This is intentionally fast and non-blocking.
     """
-    clicked = False
-
-    # Try direct click in captcha frames.
+    # Fast path: JS click inside captcha-related frames with zero waiting.
     for frame in page.frames:
-        url = (frame.url or "").lower()
-        if "recaptcha" not in url and "hcaptcha" not in url and "captcha" not in url:
+        frame_url = (frame.url or "").lower()
+        if "captcha" not in frame_url and "recaptcha" not in frame_url and "hcaptcha" not in frame_url:
             continue
-        for selector in [
-            "#recaptcha-anchor",
-            ".recaptcha-checkbox-border",
-            "div[role='checkbox']",
-            "input[type='checkbox']",
-            "#checkbox",
-        ]:
-            try:
-                target = frame.locator(selector).first
-                if target.count() == 0:
-                    continue
-                target.click(timeout=120, force=True)
-                clicked = True
-                break
-            except Exception:  # noqa: BLE001
-                continue
-        if clicked:
-            break
+        try:
+            clicked = frame.evaluate(
+                """
+                () => {
+                  const nodes = [
+                    document.querySelector('#recaptcha-anchor'),
+                    document.querySelector('.recaptcha-checkbox-border'),
+                    document.querySelector('div[role="checkbox"]'),
+                    document.querySelector('input[type="checkbox"]'),
+                    document.querySelector('#checkbox'),
+                  ].filter(Boolean);
+                  if (!nodes.length) return false;
+                  const target = nodes[0];
+                  target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                  target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                  target.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+                  return true;
+                }
+                """
+            )
+            if bool(clicked):
+                return True
+        except Exception:  # noqa: BLE001
+            continue
 
-    # Fallback: click center of visible captcha iframe.
-    if not clicked:
-        for selector in [
-            "iframe[src*='recaptcha']",
-            "iframe[src*='hcaptcha']",
-            "iframe[title*='captcha' i]",
-        ]:
-            try:
-                frame_box = page.locator(selector).first.bounding_box()
-                if frame_box:
-                    x = frame_box["x"] + frame_box["width"] / 2
-                    y = frame_box["y"] + frame_box["height"] / 2
-                    page.mouse.click(x, y)
-                    clicked = True
-                    break
-            except Exception:  # noqa: BLE001
-                continue
-    return clicked
+    # Fallback: immediate mouse click at iframe center.
+    for selector in [
+        "iframe[src*='recaptcha']",
+        "iframe[src*='hcaptcha']",
+        "iframe[title*='captcha' i]",
+    ]:
+        try:
+            frame_box = page.locator(selector).first.bounding_box()
+            if frame_box:
+                page.mouse.click(
+                    frame_box["x"] + frame_box["width"] / 2,
+                    frame_box["y"] + frame_box["height"] / 2,
+                )
+                return True
+        except Exception:  # noqa: BLE001
+            continue
+    return False
 
 
 def _parse_screen_resolution(value: str) -> tuple[int, int]:
@@ -802,6 +799,23 @@ def _parse_screen_resolution(value: str) -> tuple[int, int]:
     width = max(1280, int(match.group(1)))
     height = max(720, int(match.group(2)))
     return width, height
+
+
+def _measure_sender_proxy_latency_ms() -> float | None:
+    proxy_uri = f"socks5h://{SENDER_CAPTCHA_PROXY_HOST}:{SENDER_CAPTCHA_PROXY_PORT}"
+    start = time.perf_counter()
+    try:
+        response = requests.get(
+            SENDER_CAPTCHA_PROXY_PING_TEST_URL,
+            proxies={"http": proxy_uri, "https": proxy_uri},
+            timeout=max(1, int(SENDER_CAPTCHA_PROXY_PING_TIMEOUT_SECONDS)),
+            allow_redirects=False,
+        )
+        if response.status_code >= 500:
+            return None
+        return (time.perf_counter() - start) * 1000.0
+    except Exception:
+        return None
 
 
 def _rotate_sender_proxy_for_recovery() -> None:
@@ -815,37 +829,54 @@ def _rotate_sender_proxy_for_recovery() -> None:
     _progress(
         f"Sender captcha recovery: rotating proxy via API (same profile port {SENDER_CAPTCHA_PROXY_PORT})."
     )
-    try:
-        response = requests.get(rotate_url, timeout=max(1, int(SENDER_CAPTCHA_PROXY_ROTATE_TIMEOUT_SECONDS)))
-        payload = (response.text or "").strip()
-        if response.ok:
-            _progress(f"Proxy rotate API response: {payload[:200]}")
+    attempts = max(1, int(SENDER_CAPTCHA_PROXY_ROTATE_ATTEMPTS))
+    acceptable_ms = max(150, int(SENDER_CAPTCHA_PROXY_ACCEPTABLE_PING_MS))
+    best_ping: float | None = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            response = requests.get(rotate_url, timeout=max(1, int(SENDER_CAPTCHA_PROXY_ROTATE_TIMEOUT_SECONDS)))
+            payload = (response.text or "").strip()
+            if response.ok:
+                _progress(f"Proxy rotate API response ({attempt}/{attempts}): {payload[:160]}")
+            else:
+                _progress(f"Proxy rotate API HTTP {response.status_code} ({attempt}/{attempts}): {payload[:160]}")
+        except Exception as exc:  # noqa: BLE001
+            _progress(f"Proxy rotate API warning ({attempt}/{attempts}): {exc}")
+            continue
+
+        latency_ms = _measure_sender_proxy_latency_ms()
+        if latency_ms is None:
+            _progress(f"Proxy latency test failed ({attempt}/{attempts}), rotating again.")
+            continue
+
+        if best_ping is None or latency_ms < best_ping:
+            best_ping = latency_ms
+        _progress(f"Proxy latency after rotate ({attempt}/{attempts}): {latency_ms:.0f}ms")
+        if latency_ms <= acceptable_ms:
+            _progress(f"Proxy accepted by ping threshold: {latency_ms:.0f}ms <= {acceptable_ms}ms")
             return
-        _progress(f"Proxy rotate API HTTP {response.status_code}: {payload[:200]}")
-    except Exception as exc:  # noqa: BLE001
-        _progress(f"Proxy rotate API warning: {exc}")
+
+    if best_ping is not None:
+        _progress(f"Using best observed proxy latency after rotations: {best_ping:.0f}ms")
+    else:
+        _progress("Could not verify proxy latency; continuing with latest rotated proxy.")
 
 
 def _raise_sender_captcha(page: Page, stage: str) -> None:
     if not _sender_captcha_visible(page):
         return
 
-    clicked_any = False
-    for _ in range(3):
-        clicked = _try_instant_sender_captcha_click(page)
-        clicked_any = clicked_any or clicked
-        if clicked:
-            _progress(f"Sender captcha detected ({stage}), instant click attempt sent.")
+    clicked = _try_instant_sender_captcha_click(page)
+    if clicked:
+        _progress(f"Sender captcha detected ({stage}), instant one-click sent.")
         try:
-            page.wait_for_timeout(120)
+            page.wait_for_timeout(25)
         except Exception:  # noqa: BLE001
             pass
         if not _sender_captcha_visible(page):
             _progress("Captcha disappeared after instant click. Continuing sender.")
             return
-
-    if clicked_any:
-        _progress("Captcha still visible after instant click attempts.")
 
     raise SenderCaptchaDetected(f"Captcha detected during sender ({stage}).")
 
@@ -1922,7 +1953,7 @@ def _wait_booking_calendar_ready(page: Page, timeout_seconds: int = 12) -> None:
             return
         if _count_clickable_date_buttons(page) > 0:
             return
-        _pause(page, 120)
+        _pause(page, 40)
 
 
 def _click_first_time_button(page: Page) -> bool:
@@ -2075,7 +2106,7 @@ def _wait_booking_confirmation_with_captcha_guard(page: Page, timeout_ms: int = 
                 return
         except Exception:  # noqa: BLE001
             pass
-        _pause(page, 80)
+        _pause(page, 30)
     raise CalendlyAutomationError("Booking confirmation timeout.")
 
 
@@ -2083,7 +2114,7 @@ def _fill_booking_form(page: Page, invitee_name: str, invitee_email: str, guest_
     _progress("Filling Enter Details form.")
     _raise_sender_captcha(page, "booking form opened")
 
-    # Try strict selectors first, with human-like typing.
+    # Try strict selectors first, with fast fill.
     name_filled = False
     for selector in [
         "input[name='name']",
@@ -2095,7 +2126,7 @@ def _fill_booking_form(page: Page, invitee_name: str, invitee_email: str, guest_
         try:
             if candidate.count() == 0 or not candidate.is_visible():
                 continue
-            if _type_like_human(page, candidate, invitee_name):
+            if _fill_fast_input(candidate, invitee_name):
                 name_filled = True
                 break
         except Exception:  # noqa: BLE001
@@ -2108,7 +2139,7 @@ def _fill_booking_form(page: Page, invitee_name: str, invitee_email: str, guest_
             candidate = inputs.nth(idx)
             try:
                 if candidate.is_visible():
-                    if _type_like_human(page, candidate, invitee_name):
+                    if _fill_fast_input(candidate, invitee_name):
                         name_filled = True
                         break
             except Exception:  # noqa: BLE001
@@ -2155,7 +2186,7 @@ def _fill_booking_form(page: Page, invitee_name: str, invitee_email: str, guest_
         try:
             if candidate.count() == 0 or not candidate.is_visible():
                 continue
-            if _type_like_human(page, candidate, invitee_email):
+            if _fill_fast_input(candidate, invitee_email):
                 email_filled = True
                 break
         except Exception:  # noqa: BLE001
@@ -2173,7 +2204,7 @@ def _fill_booking_form(page: Page, invitee_name: str, invitee_email: str, guest_
                 continue
         if len(visible_indices) >= 2:
             try:
-                email_filled = _type_like_human(page, inputs.nth(visible_indices[1]), invitee_email)
+                email_filled = _fill_fast_input(inputs.nth(visible_indices[1]), invitee_email)
             except Exception:  # noqa: BLE001
                 pass
     if not email_filled:
@@ -2237,7 +2268,7 @@ def _fill_booking_form(page: Page, invitee_name: str, invitee_email: str, guest_
             for guest in guest_emails:
                 try:
                     guest_input.click(timeout=1_500)
-                    if not _type_like_human(page, guest_input, guest):
+                    if not _fill_fast_input(guest_input, guest):
                         guest_input.fill(guest)
                     guest_input.press("Enter")
                     _pause(page, 40)
