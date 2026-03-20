@@ -19,6 +19,9 @@ EMAIL_DIR_CANDIDATES = [BASE_DIR / "email", BASE_DIR / "EMAIL"]
 SUBJECT_FILENAME = "SUBJECT.txt"
 MESSAGE_FILENAME = "MESSAGE.txt"
 EMAIL_FILENAMES = ("emails.txt", "email.txt")
+SENT_EMAILS_DIR = BASE_DIR / "sent-emails"
+SENT_EMAILS_TXT = "sent_emails.txt"
+SENT_EMAILS_DB = "sent_emails.db"
 
 PROFILE_DB_PATH = BASE_DIR / "profiles.db"
 LOGS_DIR = BASE_DIR / "logs"

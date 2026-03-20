@@ -28,6 +28,7 @@ from config import (
     SUBJECT_FILENAME,
 )
 from profile_store import Profile
+from sent_store import SentEmailStore
 
 
 class InflowAutomationError(RuntimeError):
@@ -37,11 +38,19 @@ class InflowAutomationError(RuntimeError):
 @dataclass
 class RunStats:
     total_input_emails: int
+    already_sent_emails: int
     processable_emails: int
     sent_emails: int
     failed_emails: int
     skipped_emails: int
     last_error: str | None
+
+
+@dataclass
+class DashboardStats:
+    total_input_emails: int
+    already_sent_emails: int
+    unsent_emails: int
 
 
 def _resolve_or_create_dir(candidates: list[Path]) -> Path:
@@ -72,6 +81,7 @@ def ensure_input_files() -> None:
         )
 
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    SentEmailStore().ensure_ready()
 
 
 def _read_non_empty_lines(file_path: Path) -> list[str]:
@@ -111,9 +121,8 @@ def _group_email_triplets(emails: list[str]) -> list[tuple[str, str, str]]:
     return triplets
 
 
-def load_job_data() -> tuple[str, str, list[str], list[tuple[str, str, str]]]:
+def load_message_data() -> tuple[str, str]:
     edit_dir = _resolve_or_create_dir(EDIT_DIR_CANDIDATES)
-    email_dir = _resolve_or_create_dir(EMAIL_DIR_CANDIDATES)
 
     subject = (edit_dir / SUBJECT_FILENAME).read_text(encoding="utf-8").strip()
     if not subject:
@@ -123,16 +132,54 @@ def load_job_data() -> tuple[str, str, list[str], list[tuple[str, str, str]]]:
     if not message:
         raise InflowAutomationError(f"Файл {MESSAGE_FILENAME} пуст.")
 
+    return subject, message
+
+
+def load_job_data() -> tuple[str, str, list[str], list[tuple[str, str, str]], int]:
+    subject, message = load_message_data()
+    email_dir = _resolve_or_create_dir(EMAIL_DIR_CANDIDATES)
+
     email_file = _find_email_file(email_dir)
-    emails = _read_non_empty_lines(email_file)
-    if len(emails) < 3:
+    emails_all = _read_non_empty_lines(email_file)
+    if len(emails_all) < 3:
         raise InflowAutomationError("Нужно минимум 3 email для заполнения TO/CC/BCC.")
 
-    triplets = _group_email_triplets(emails)
+    sent_store = SentEmailStore()
+    sent_set = sent_store.get_all()
+    pending_emails = [email for email in emails_all if email.strip().lower() not in sent_set]
+    already_sent = len(emails_all) - len(pending_emails)
+
+    if len(pending_emails) < 3:
+        raise InflowAutomationError(
+            "Недостаточно новых email для отправки (минимум 3). Пополните email файл новыми адресами."
+        )
+
+    triplets = _group_email_triplets(pending_emails)
     if not triplets:
         raise InflowAutomationError("Нет полной тройки email для TO/CC/BCC.")
 
-    return subject, message, emails, triplets
+    processable = len(triplets) * 3
+    return subject, message, emails_all, triplets, already_sent + (len(pending_emails) - processable)
+
+
+def get_dashboard_stats() -> DashboardStats:
+    try:
+        email_dir = _resolve_or_create_dir(EMAIL_DIR_CANDIDATES)
+        email_file = _find_email_file(email_dir)
+        emails_all = _read_non_empty_lines(email_file)
+    except Exception:  # noqa: BLE001
+        emails_all = []
+
+    sent_store = SentEmailStore()
+    sent_set = sent_store.get_all()
+    already_sent = sum(1 for email in emails_all if email.strip().lower() in sent_set)
+    unsent = max(0, len(emails_all) - already_sent)
+
+    return DashboardStats(
+        total_input_emails=len(emails_all),
+        already_sent_emails=already_sent,
+        unsent_emails=unsent,
+    )
 
 
 class InflowUi:
@@ -490,8 +537,10 @@ class InflowUi:
         _write_log("Send modal opened, start filling fields.")
 
         self._fill_recipient_input(dialog, to_email, r"enter\s*to\s*email", "to", fallback_index=0)
-        self._fill_recipient_input(dialog, cc_email, r"enter\s*cc\s*email", "cc", fallback_index=1)
-        self._fill_recipient_input(dialog, bcc_email, r"enter\s*bcc\s*email", "bcc", fallback_index=2)
+        if cc_email.strip():
+            self._fill_recipient_input(dialog, cc_email, r"enter\s*cc\s*email", "cc", fallback_index=1)
+        if bcc_email.strip():
+            self._fill_recipient_input(dialog, bcc_email, r"enter\s*bcc\s*email", "bcc", fallback_index=2)
         self._fill_subject_input(dialog, subject, fallback_index=3)
         self._fill_message(dialog, message)
         _write_log("Fields filled, clicking Send.")
@@ -517,13 +566,15 @@ def run_job(profile: Profile) -> RunStats:
         )
 
     ensure_input_files()
-    subject, message, emails, triplets = load_job_data()
+    subject, message, emails_all, triplets, already_sent_emails = load_job_data()
 
     ads_client = AdsApiClient()
+    sent_store = SentEmailStore()
     ads_session = None
     sent_emails = 0
     failed_emails = 0
-    skipped_emails = len(emails) - len(triplets) * 3
+    processable_emails = len(triplets) * 3
+    skipped_emails = len(emails_all) - already_sent_emails - processable_emails
     last_error: str | None = None
     fatal_error = False
 
@@ -531,7 +582,8 @@ def run_job(profile: Profile) -> RunStats:
         _write_log(
             "Job started "
             f"profile={profile.ads_profile_id}; url={profile.start_url}; "
-            f"emails={len(emails)}; orders={len(triplets)}; skipped={skipped_emails}"
+            f"emails={len(emails_all)}; processable={processable_emails}; "
+            f"already_sent={already_sent_emails}; skipped={skipped_emails}"
         )
 
         ads_session = ads_client.start_browser(
@@ -567,7 +619,7 @@ def run_job(profile: Profile) -> RunStats:
                         last_error = str(order_exc)
                         _write_log(
                             "Order attempt failed: "
-                            f"attempt={attempt + 1}/3; TO={to_email}, CC={cc_email}, BCC={bcc_email}; "
+                            f"attempt={attempt + 1}/2; TO={to_email}, CC={cc_email}, BCC={bcc_email}; "
                             f"error={order_exc}"
                         )
                         try:
@@ -580,6 +632,8 @@ def run_job(profile: Profile) -> RunStats:
                         time.sleep(self_heal_delay)
                 if not sent_current:
                     failed_emails += 3
+                else:
+                    sent_store.mark_many([to_email, cc_email, bcc_email])
                 time.sleep(SEND_DELAY_SECONDS)
     except AdsApiError:
         raise
@@ -593,16 +647,71 @@ def run_job(profile: Profile) -> RunStats:
         elif ads_session is not None:
             _write_log("Browser left open because there were automation errors.")
         _write_log(
-            f"Job finished: total_emails={len(emails)}, total_orders={len(triplets)}, "
+            f"Job finished: total_emails={len(emails_all)}, total_orders={len(triplets)}, "
             f"sent_emails={sent_emails}, failed_emails={failed_emails}, skipped={skipped_emails}"
         )
 
     return RunStats(
-        total_input_emails=len(emails),
-        processable_emails=len(triplets) * 3,
+        total_input_emails=len(emails_all),
+        already_sent_emails=already_sent_emails,
+        processable_emails=processable_emails,
         sent_emails=sent_emails,
         failed_emails=failed_emails,
         skipped_emails=skipped_emails,
+        last_error=last_error,
+    )
+
+
+def run_inbox_check(profile: Profile, target_email: str) -> RunStats:
+    if sync_playwright is None:
+        raise InflowAutomationError(
+            "Модуль playwright не установлен. Выполните: pip install -r requirements.txt"
+        )
+
+    target_email = target_email.strip()
+    if "@" not in target_email:
+        raise InflowAutomationError("Неверный email для проверки инбокса.")
+
+    ensure_input_files()
+    subject, message = load_message_data()
+
+    ads_client = AdsApiClient()
+    ads_session = None
+    last_error: str | None = None
+
+    try:
+        ads_session = ads_client.start_browser(
+            profile_id=profile.ads_profile_id,
+            headless=ADS_HEADLESS,
+            open_tabs=ADS_OPEN_TABS,
+        )
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.connect_over_cdp(ads_session.cdp_url)
+            context = browser.contexts[0] if browser.contexts else browser.new_context()
+            page = context.pages[0] if context.pages else context.new_page()
+            ui = InflowUi(page)
+            ui.open_page(profile.start_url or DEFAULT_INFLOW_URL)
+            ui.send_purchase_order(
+                to_email=target_email,
+                cc_email="",
+                bcc_email="",
+                subject=subject,
+                message=message,
+            )
+    except Exception as exc:  # noqa: BLE001
+        last_error = str(exc)
+        raise InflowAutomationError(str(exc)) from exc
+    finally:
+        if ads_session is not None:
+            ads_client.stop_browser(ads_session.profile_id)
+
+    return RunStats(
+        total_input_emails=1,
+        already_sent_emails=0,
+        processable_emails=1,
+        sent_emails=1,
+        failed_emails=0,
+        skipped_emails=0,
         last_error=last_error,
     )
 
