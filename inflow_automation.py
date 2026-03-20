@@ -314,40 +314,59 @@ class InflowUi:
         except Exception:  # noqa: BLE001
             pass
 
-        # Primary path: ask Chromium to maximize the native browser window.
-        try:
-            cdp = self.page.context.new_cdp_session(self.page)
-            window_info = cdp.send("Browser.getWindowForTarget")
-            window_id = window_info.get("windowId")
-            if isinstance(window_id, int):
-                cdp.send(
-                    "Browser.setWindowBounds",
-                    {"windowId": window_id, "bounds": {"windowState": "maximized"}},
-                )
-                self.page.wait_for_timeout(250)
-        except Exception:  # noqa: BLE001
-            pass
-
-        # Fallback: emulate F11 fullscreen (some ADS builds ignore window bounds).
-        if not self._f11_used:
+        # Try all known strategies in sequence; this improves stability across ADS builds/OS.
+        for _ in range(2):
             try:
-                self.page.keyboard.press("F11")
-                self.page.wait_for_timeout(250)
-                self._f11_used = True
+                cdp = self.page.context.new_cdp_session(self.page)
+                window_info = cdp.send("Browser.getWindowForTarget")
+                window_id = window_info.get("windowId")
+                if isinstance(window_id, int):
+                    for state in ("fullscreen", "maximized", "normal"):
+                        bounds = {"windowState": state}
+                        if state == "normal":
+                            bounds = {"left": 0, "top": 0, "width": 1920, "height": 1080}
+                        try:
+                            cdp.send("Browser.setWindowBounds", {"windowId": window_id, "bounds": bounds})
+                            self.page.wait_for_timeout(120)
+                        except Exception:  # noqa: BLE001
+                            continue
             except Exception:  # noqa: BLE001
                 pass
 
-        # Final fallback: viewport + JS resize.
-        try:
-            self.page.set_viewport_size({"width": 1920, "height": 1080})
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            self.page.evaluate(
-                "() => { try { window.moveTo(0, 0); window.resizeTo(screen.availWidth, screen.availHeight); } catch (e) {} }"
-            )
-        except Exception:  # noqa: BLE001
-            pass
+            if not self._f11_used:
+                try:
+                    self.page.keyboard.press("F11")
+                    self.page.wait_for_timeout(180)
+                    self._f11_used = True
+                except Exception:  # noqa: BLE001
+                    pass
+
+            # Additional full-screen shortcuts for some window managers.
+            for shortcut in ("Control+Shift+F", "Meta+Control+F", "Alt+Enter"):
+                try:
+                    self.page.keyboard.press(shortcut)
+                    self.page.wait_for_timeout(80)
+                except Exception:  # noqa: BLE001
+                    continue
+
+            try:
+                self.page.set_viewport_size({"width": 1920, "height": 1080})
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                self.page.evaluate(
+                    "() => {"
+                    "  try {"
+                    "    window.moveTo(0, 0);"
+                    "    window.resizeTo(screen.availWidth, screen.availHeight);"
+                    "    if (document.documentElement && document.documentElement.requestFullscreen) {"
+                    "      document.documentElement.requestFullscreen().catch(() => {});"
+                    "    }"
+                    "  } catch (e) {}"
+                    "}"
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
     def wait_until_ready(self, timeout_ms: int = 60_000) -> None:
         deadline = time.time() + (timeout_ms / 1000)
@@ -700,6 +719,46 @@ class InflowUi:
             self.page.wait_for_timeout(180)
         raise InflowAutomationError(f"Не удалось найти поле ввода: {label_patterns}")
 
+    def _wait_signup_email_input(self, timeout_ms: int = 20_000) -> Locator:
+        deadline = time.time() + (timeout_ms / 1000)
+        candidates = [
+            self.page.locator("input[type='email']"),
+            self.page.locator("input[name*='email' i]"),
+            self.page.locator("input[id*='email' i]"),
+            self.page.locator("input[autocomplete='email']"),
+            self.page.get_by_placeholder(re.compile(r"email", re.I)),
+            self.page.get_by_label(re.compile(r"work\\s*email|email", re.I)),
+        ]
+        while time.time() < deadline:
+            for locator in candidates:
+                try:
+                    if locator.count() == 0:
+                        continue
+                    field = locator.first
+                    if field.is_visible():
+                        return field
+                except Exception:  # noqa: BLE001
+                    continue
+            self.page.wait_for_timeout(160)
+        raise InflowAutomationError("Не удалось найти поле Work email на странице signup.")
+
+    def _signup_fill_email_and_continue(self, email: str) -> None:
+        field = self._wait_signup_email_input(timeout_ms=25_000)
+        self._type_into_field(field, email, confirm_with_enter=False)
+        # Try explicit button first, then Enter fallback.
+        try:
+            self._click_by_text_patterns([r"continue", r"next", r"start"], timeout_ms=6_000)
+            return
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            field.press("Enter")
+            self.page.wait_for_timeout(250)
+            return
+        except Exception:  # noqa: BLE001
+            pass
+        raise InflowAutomationError("Не удалось продолжить после ввода Work email.")
+
     def _wait_url_contains(self, expected_substring: str, timeout_ms: int = 20_000) -> None:
         deadline = time.time() + (timeout_ms / 1000)
         needle = expected_substring.lower()
@@ -749,12 +808,18 @@ class InflowUi:
         _write_log(f"Bought gmail via AnyMessage: {mailbox.email}")
 
         _write_log("Шаг 2/8: Открываю страницу регистрации Inflow.")
+        self.maximize_window()
         self.page.goto(INFLOW_SIGNUP_URL, wait_until="domcontentloaded", timeout=90_000)
-        self.page.wait_for_load_state("networkidle", timeout=60_000)
+        # Avoid long hangs on networkidle (tracking/telemetry can keep connections open).
+        try:
+            self.page.wait_for_load_state("load", timeout=12_000)
+        except Exception:  # noqa: BLE001
+            pass
+        self.maximize_window()
 
         _write_log("Шаг 3/8: Ввожу рабочую почту и продолжаю.")
-        self._fill_first_visible_input(mailbox.email, [r"work email", r"email"], timeout_ms=25_000)
-        self._click_by_text_patterns([r"continue", r"next"], timeout_ms=20_000)
+        self._signup_fill_email_and_continue(mailbox.email)
+        self.maximize_window()
 
         _write_log("Шаг 4/8: Заполняю имя, телефон и пароль.")
         self._fill_first_visible_input(registration_name, [r"name", r"full name"], timeout_ms=20_000)
