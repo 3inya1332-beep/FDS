@@ -277,64 +277,68 @@ class InflowUi:
     def _type_into_field(self, field: Locator, value: str, *, confirm_with_enter: bool) -> None:
         field.scroll_into_view_if_needed()
         field.click()
-        self.page.keyboard.press("Control+A")
-        self.page.keyboard.press("Backspace")
-        self.page.keyboard.type(value, delay=14)
+        try:
+            field.fill("")
+            field.fill(value)
+        except Exception:  # noqa: BLE001
+            self.page.keyboard.press("Control+A")
+            self.page.keyboard.press("Backspace")
+            self.page.keyboard.type(value, delay=20)
         if confirm_with_enter:
             self.page.keyboard.press("Enter")
+            self.page.wait_for_timeout(200)
 
-    def _fill_input(
-        self,
-        dialog: Locator,
-        *,
-        value: str,
-        label: str,
-        placeholder_pattern: str,
-        fallback_index: int,
-        confirm_with_enter: bool,
-    ) -> None:
-        candidates: list[Locator] = []
-
-        if placeholder_pattern:
-            candidates.append(dialog.get_by_placeholder(re.compile(placeholder_pattern, re.I)))
-
-        candidates.extend(
-            [
-                dialog.locator(
-                    f"xpath=.//*[normalize-space(text())='{label}']/following::input[1]"
-                ),
-                dialog.locator(
-                    "xpath=.//*[contains(translate(normalize-space(text()), "
-                    "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), "
-                    f"'{label.lower()}')]/following::input[1]"
-                ),
-                dialog.locator(
-                    f"xpath=.//*[normalize-space(text())='{label}']/following::*[@contenteditable='true'][1]"
-                ),
-                dialog.locator(
-                    "xpath=.//*[contains(translate(normalize-space(text()), "
-                    "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), "
-                    f"'{label.lower()}')]/following::*[@contenteditable='true'][1]"
-                ),
-            ]
-        )
-
-        all_inputs = dialog.locator("input:not([type='hidden'])")
-        if all_inputs.count() > fallback_index:
-            candidates.append(all_inputs.nth(fallback_index))
-
+    def _first_visible_field(self, candidates: list[Locator], timeout_ms: int = 2_000) -> Locator | None:
         for locator in candidates:
             try:
                 if locator.count() == 0:
                     continue
                 field = locator.first
-                field.wait_for(state="visible", timeout=5_000)
-                self._type_into_field(field, value, confirm_with_enter=confirm_with_enter)
-                return
+                field.wait_for(state="visible", timeout=timeout_ms)
+                return field
             except Exception:  # noqa: BLE001
                 continue
+        return None
 
-        raise InflowAutomationError(f"Не удалось заполнить поле {label}.")
+    def _fill_recipient_input(self, dialog: Locator, email: str, placeholder_pattern: str, label: str) -> None:
+        candidates = [
+            dialog.get_by_placeholder(re.compile(placeholder_pattern, re.I)),
+            self.page.get_by_placeholder(re.compile(placeholder_pattern, re.I)),
+            dialog.locator(
+                "xpath=.//*[contains(translate(normalize-space(text()), "
+                "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), "
+                f"'{label.lower()}')]/following::input[1]"
+            ),
+            self.page.locator(
+                "xpath=//*[contains(translate(normalize-space(text()), "
+                "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), "
+                f"'{label.lower()}')]/following::input[1]"
+            ),
+        ]
+        field = self._first_visible_field(candidates)
+        if field is None:
+            raise InflowAutomationError(f"Не удалось найти поле {label}.")
+        self._type_into_field(field, email, confirm_with_enter=True)
+
+    def _fill_subject_input(self, dialog: Locator, subject: str) -> None:
+        candidates = [
+            dialog.locator(
+                "xpath=.//*[contains(translate(normalize-space(text()), "
+                "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), "
+                "'subject')]/following::input[1]"
+            ),
+            self.page.locator(
+                "xpath=//*[contains(translate(normalize-space(text()), "
+                "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), "
+                "'subject')]/following::input[1]"
+            ),
+            dialog.get_by_placeholder(re.compile(r"subject", re.I)),
+            self.page.get_by_placeholder(re.compile(r"subject", re.I)),
+        ]
+        field = self._first_visible_field(candidates)
+        if field is None:
+            raise InflowAutomationError("Не удалось найти поле Subject.")
+        self._type_into_field(field, subject, confirm_with_enter=False)
 
     def _fill_message(self, dialog: Locator, message: str) -> None:
         label_area = dialog.locator(
@@ -385,40 +389,14 @@ class InflowUi:
         message: str,
     ) -> None:
         dialog = self.open_purchase_order_modal()
+        _write_log("Send modal opened, start filling fields.")
 
-        self._fill_input(
-            dialog,
-            value=to_email,
-            label="To",
-            placeholder_pattern=r"to.*email",
-            fallback_index=1,
-            confirm_with_enter=True,
-        )
-        self._fill_input(
-            dialog,
-            value=cc_email,
-            label="Cc",
-            placeholder_pattern=r"cc.*email",
-            fallback_index=2,
-            confirm_with_enter=True,
-        )
-        self._fill_input(
-            dialog,
-            value=bcc_email,
-            label="Bcc",
-            placeholder_pattern=r"bcc.*email",
-            fallback_index=3,
-            confirm_with_enter=True,
-        )
-        self._fill_input(
-            dialog,
-            value=subject,
-            label="Subject",
-            placeholder_pattern=r"subject",
-            fallback_index=4,
-            confirm_with_enter=False,
-        )
+        self._fill_recipient_input(dialog, to_email, r"enter\s*to\s*email", "to")
+        self._fill_recipient_input(dialog, cc_email, r"enter\s*cc\s*email", "cc")
+        self._fill_recipient_input(dialog, bcc_email, r"enter\s*bcc\s*email", "bcc")
+        self._fill_subject_input(dialog, subject)
         self._fill_message(dialog, message)
+        _write_log("Fields filled, clicking Send.")
 
         self._click_first_available(
             [
