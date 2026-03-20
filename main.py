@@ -88,26 +88,16 @@ def _mask_secret(value: str) -> str:
 
 def show_api_settings(settings_store: RuntimeSettingsStore) -> None:
     settings = settings_store.load()
-    proxy_line = (
-        f"{settings.proxy_type}://{settings.proxy_host}:{settings.proxy_port}"
-        if settings.proxy_enabled and settings.proxy_host and settings.proxy_port
-        else "выключен"
-    )
     lines = [
-        f"ADS API BASE: {settings.ads_api_base}",
         f"ADS API KEY: {_mask_secret(settings.ads_api_key)}",
-        f"ANYMESSAGE API BASE: {settings.anymessage_api_base}",
         f"ANYMESSAGE TOKEN: {_mask_secret(settings.anymessage_api_token)}",
-        f"ANYMESSAGE SERVICE: {settings.anymessage_service}",
-        f"PROXY: {proxy_line}",
-        f"PROXY USER: {_mask_secret(settings.proxy_username)}",
+        f"PROXY API: {settings.proxy_api_url or '(пусто)'}",
     ]
     _print_box(lines, title="API / PROXY SETTINGS")
 
 
 def _setup_ads_api_flow(settings_store: RuntimeSettingsStore) -> None:
     settings = settings_store.load()
-    settings.ads_api_base = input(f"ADS API BASE [{settings.ads_api_base}]: ").strip() or settings.ads_api_base
     ads_key = input(f"ADS API KEY [{_mask_secret(settings.ads_api_key)}]: ").strip()
     if ads_key:
         settings.ads_api_key = ads_key
@@ -117,41 +107,18 @@ def _setup_ads_api_flow(settings_store: RuntimeSettingsStore) -> None:
 
 def _setup_anymessage_api_flow(settings_store: RuntimeSettingsStore) -> None:
     settings = settings_store.load()
-    settings.anymessage_api_base = (
-        input(f"ANYMESSAGE API BASE [{settings.anymessage_api_base}]: ").strip() or settings.anymessage_api_base
-    )
     anymessage_token = input(f"ANYMESSAGE TOKEN [{_mask_secret(settings.anymessage_api_token)}]: ").strip()
     if anymessage_token:
         settings.anymessage_api_token = anymessage_token
-    settings.anymessage_service = (
-        input(f"ANYMESSAGE SERVICE [{settings.anymessage_service}]: ").strip() or settings.anymessage_service
-    )
     settings_store.save(settings)
     print("✅ AnyMessage API настройки сохранены.")
 
 
 def _setup_proxy_flow(settings_store: RuntimeSettingsStore) -> None:
     settings = settings_store.load()
-    settings.proxy_enabled = ask_yes_no(
-        f"Включить PROXY? [{'Y/n' if settings.proxy_enabled else 'y/N'}]: ",
-        default=settings.proxy_enabled,
+    settings.proxy_api_url = (
+        input(f"PROXY API URL [{settings.proxy_api_url}]: ").strip() or settings.proxy_api_url
     )
-    if settings.proxy_enabled:
-        settings.proxy_type = input(f"PROXY TYPE [{settings.proxy_type}]: ").strip() or settings.proxy_type
-        settings.proxy_host = input(f"PROXY HOST [{settings.proxy_host}]: ").strip() or settings.proxy_host
-        settings.proxy_port = input(f"PROXY PORT [{settings.proxy_port}]: ").strip() or settings.proxy_port
-        settings.proxy_username = input(f"PROXY USER [{settings.proxy_username}]: ").strip() or settings.proxy_username
-        proxy_pass = input(
-            f"PROXY PASS [{'***' if settings.proxy_password else '(пусто)'}]: "
-        ).strip()
-        if proxy_pass:
-            settings.proxy_password = proxy_pass
-    else:
-        settings.proxy_type = "http"
-        settings.proxy_host = ""
-        settings.proxy_port = ""
-        settings.proxy_username = ""
-        settings.proxy_password = ""
     settings_store.save(settings)
     print("✅ Proxy настройки сохранены.")
 

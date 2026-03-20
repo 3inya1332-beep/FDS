@@ -6,12 +6,9 @@ from pathlib import Path
 from typing import Any
 
 from config import (
-    ANYMESSAGE_API_BASE,
     ANYMESSAGE_API_TOKEN,
-    ANYMESSAGE_SERVICE,
     API_KEY,
     BASE_DIR,
-    LOCAL_API_BASE,
 )
 
 
@@ -20,35 +17,9 @@ SETTINGS_PATH = BASE_DIR / "runtime_settings.json"
 
 @dataclass
 class RuntimeSettings:
-    ads_api_base: str = LOCAL_API_BASE
     ads_api_key: str = API_KEY
-    anymessage_api_base: str = ANYMESSAGE_API_BASE
     anymessage_api_token: str = ANYMESSAGE_API_TOKEN
-    anymessage_service: str = ANYMESSAGE_SERVICE
-    proxy_enabled: bool = False
-    proxy_type: str = "http"
-    proxy_host: str = ""
-    proxy_port: str = ""
-    proxy_username: str = ""
-    proxy_password: str = ""
-
-    def proxy_config(self) -> dict[str, str] | None:
-        if not self.proxy_enabled:
-            return None
-        host = self.proxy_host.strip()
-        port = self.proxy_port.strip()
-        if not host or not port:
-            return None
-        config: dict[str, str] = {
-            "proxy_type": (self.proxy_type or "http").strip(),
-            "proxy_host": host,
-            "proxy_port": port,
-        }
-        if self.proxy_username.strip():
-            config["proxy_username"] = self.proxy_username.strip()
-        if self.proxy_password.strip():
-            config["proxy_password"] = self.proxy_password.strip()
-        return config
+    proxy_api_url: str = "http://127.0.0.1:10101/api/proxy?t=2&num=1"
 
 
 class RuntimeSettingsStore:

@@ -28,13 +28,17 @@ from config import (
     EMAIL_DIR_CANDIDATES,
     EMAIL_FILENAMES,
     INFLOW_SIGNUP_URL,
+    LOCAL_API_BASE,
     LOGS_DIR,
     MESSAGE_FILENAME,
+    ANYMESSAGE_API_BASE,
+    ANYMESSAGE_SERVICE,
     SEND_DELAY_SECONDS,
     SUBJECT_FILENAME,
     UK_PHONE_DIGITS,
 )
 from profile_store import Profile, ProfileStore
+from proxy_api import ProxyApiClient, ProxyApiError
 from runtime_settings import RuntimeSettings, RuntimeSettingsStore
 from sent_store import SentEmailStore
 
@@ -207,15 +211,31 @@ def _load_runtime_settings(runtime_settings: RuntimeSettings | None) -> RuntimeS
 
 
 def _build_ads_client(settings: RuntimeSettings) -> AdsApiClient:
-    return AdsApiClient(base_url=settings.ads_api_base, api_key=settings.ads_api_key)
+    return AdsApiClient(base_url=LOCAL_API_BASE, api_key=settings.ads_api_key)
 
 
 def _build_anymessage_client(settings: RuntimeSettings) -> AnyMessageClient:
     return AnyMessageClient(
-        api_base=settings.anymessage_api_base,
+        api_base=ANYMESSAGE_API_BASE,
         api_token=settings.anymessage_api_token,
-        service=settings.anymessage_service,
+        service=ANYMESSAGE_SERVICE,
     )
+
+
+def _resolve_best_proxy(settings: RuntimeSettings) -> dict[str, str] | None:
+    proxy_url = settings.proxy_api_url.strip()
+    if not proxy_url:
+        return None
+    client = ProxyApiClient(api_url=proxy_url)
+    candidate = client.fetch_best_proxy()
+    if candidate.ping_ms is not None:
+        _write_log(
+            f"Proxy selected by best ping: {candidate.proxy_host}:{candidate.proxy_port} "
+            f"({candidate.ping_ms:.2f}ms)"
+        )
+    else:
+        _write_log(f"Proxy selected: {candidate.proxy_host}:{candidate.proxy_port} (ping not provided)")
+    return candidate.to_ads_payload()
 
 
 def _random_password(length: int = 14) -> str:
@@ -817,7 +837,8 @@ def _rotate_profile_on_limit(
         raise InflowAutomationError("AUTO_REREGISTER_ON_LIMIT disabled in config.")
 
     new_ads_name = f"{registration_name.strip() or current_profile.name.strip() or 'inflow'}-{_random_word(6)}"
-    new_profile_id = ads_client.create_profile(new_ads_name, proxy_config=runtime_settings.proxy_config())
+    proxy_payload = _resolve_best_proxy(runtime_settings)
+    new_profile_id = ads_client.create_profile(new_ads_name, proxy_config=proxy_payload)
     _write_log(f"New ADS profile created: {new_profile_id}")
 
     anymessage_client = _build_anymessage_client(runtime_settings)
@@ -1010,6 +1031,9 @@ def run_job(
                             pass
     except AdsApiError:
         raise
+    except ProxyApiError as exc:
+        last_error = str(exc)
+        raise InflowAutomationError(str(exc)) from exc
     except AnyMessageApiError as exc:
         last_error = str(exc)
         raise InflowAutomationError(str(exc)) from exc
@@ -1048,16 +1072,19 @@ def register_new_account_for_profile(
     ads_client = _build_ads_client(active_settings)
     registration_name = (registration_name or profile.name).strip() or "Inflow User"
 
-    with sync_playwright() as playwright:
-        return _rotate_profile_on_limit(
-            current_profile=profile,
-            registration_name=registration_name,
-            ads_client=ads_client,
-            playwright=playwright,
-            profile_store=profile_store,
-            runtime_settings=active_settings,
-            delete_old_profile=True,
-        )
+    try:
+        with sync_playwright() as playwright:
+            return _rotate_profile_on_limit(
+                current_profile=profile,
+                registration_name=registration_name,
+                ads_client=ads_client,
+                playwright=playwright,
+                profile_store=profile_store,
+                runtime_settings=active_settings,
+                delete_old_profile=True,
+            )
+    except (ProxyApiError, AnyMessageApiError) as exc:
+        raise InflowAutomationError(str(exc)) from exc
 
 
 def run_inbox_check(profile: Profile, target_email: str) -> RunStats:
