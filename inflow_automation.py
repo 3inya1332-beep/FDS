@@ -35,6 +35,7 @@ from config import (
     UK_PHONE_DIGITS,
 )
 from profile_store import Profile, ProfileStore
+from runtime_settings import RuntimeSettings, RuntimeSettingsStore
 from sent_store import SentEmailStore
 
 
@@ -196,6 +197,24 @@ def get_dashboard_stats() -> DashboardStats:
         total_input_emails=len(emails_all),
         already_sent_emails=already_sent,
         unsent_emails=unsent,
+    )
+
+
+def _load_runtime_settings(runtime_settings: RuntimeSettings | None) -> RuntimeSettings:
+    if runtime_settings is not None:
+        return runtime_settings
+    return RuntimeSettingsStore().load()
+
+
+def _build_ads_client(settings: RuntimeSettings) -> AdsApiClient:
+    return AdsApiClient(base_url=settings.ads_api_base, api_key=settings.ads_api_key)
+
+
+def _build_anymessage_client(settings: RuntimeSettings) -> AnyMessageClient:
+    return AnyMessageClient(
+        api_base=settings.anymessage_api_base,
+        api_token=settings.anymessage_api_token,
+        service=settings.anymessage_service,
     )
 
 
@@ -791,15 +810,17 @@ def _rotate_profile_on_limit(
     ads_client: AdsApiClient,
     playwright: Any,
     profile_store: ProfileStore | None,
+    runtime_settings: RuntimeSettings,
+    delete_old_profile: bool = True,
 ) -> RotationResult:
     if not AUTO_REREGISTER_ON_LIMIT:
         raise InflowAutomationError("AUTO_REREGISTER_ON_LIMIT disabled in config.")
 
     new_ads_name = f"{registration_name.strip() or current_profile.name.strip() or 'inflow'}-{_random_word(6)}"
-    new_profile_id = ads_client.create_profile(new_ads_name)
+    new_profile_id = ads_client.create_profile(new_ads_name, proxy_config=runtime_settings.proxy_config())
     _write_log(f"New ADS profile created: {new_profile_id}")
 
-    anymessage_client = AnyMessageClient()
+    anymessage_client = _build_anymessage_client(runtime_settings)
     new_session = ads_client.start_browser(
         profile_id=new_profile_id,
         headless=ADS_HEADLESS,
@@ -819,8 +840,9 @@ def _rotate_profile_on_limit(
 
     _write_log(f"New Inflow account prepared with purchase URL: {new_start_url}")
 
-    ads_client.delete_profile(current_profile.ads_profile_id)
-    _write_log(f"Old ADS profile deleted: {current_profile.ads_profile_id}")
+    if delete_old_profile:
+        ads_client.delete_profile(current_profile.ads_profile_id)
+        _write_log(f"Old ADS profile deleted: {current_profile.ads_profile_id}")
 
     if profile_store is not None:
         updated = profile_store.update_profile_credentials(
@@ -838,6 +860,8 @@ def run_job(
     profile: Profile,
     registration_name: str | None = None,
     profile_store: ProfileStore | None = None,
+    runtime_settings: RuntimeSettings | None = None,
+    register_before_send: bool = False,
 ) -> RunStats:
     if sync_playwright is None:
         raise InflowAutomationError(
@@ -847,7 +871,8 @@ def run_job(
     ensure_input_files()
     subject, message, emails_all, triplets, already_sent_emails = load_job_data()
 
-    ads_client = AdsApiClient()
+    active_settings = _load_runtime_settings(runtime_settings)
+    ads_client = _build_ads_client(active_settings)
     sent_store = SentEmailStore()
     sent_emails = 0
     failed_emails = 0
@@ -868,6 +893,27 @@ def run_job(
         )
 
         with sync_playwright() as playwright:
+            if register_before_send:
+                _write_log("Initial registration requested before sending.")
+                rotated = _rotate_profile_on_limit(
+                    current_profile=Profile(
+                        local_id=profile.local_id,
+                        name=profile.name,
+                        ads_profile_id=current_profile_id,
+                        start_url=current_start_url,
+                        created_at=profile.created_at,
+                    ),
+                    registration_name=registration_name,
+                    ads_client=ads_client,
+                    playwright=playwright,
+                    profile_store=profile_store,
+                    runtime_settings=active_settings,
+                    delete_old_profile=True,
+                )
+                current_profile_id = rotated.new_profile_id
+                current_start_url = rotated.new_start_url
+                _write_log(f"Initial registration complete. profile={current_profile_id}, url={current_start_url}")
+
             index = 0
             while index < len(triplets):
                 to_email, cc_email, bcc_email = triplets[index]
@@ -943,6 +989,7 @@ def run_job(
                             ads_client=ads_client,
                             playwright=playwright,
                             profile_store=profile_store,
+                            runtime_settings=active_settings,
                         )
                         current_profile_id = rotated.new_profile_id
                         current_start_url = rotated.new_start_url
@@ -986,6 +1033,33 @@ def run_job(
     )
 
 
+def register_new_account_for_profile(
+    profile: Profile,
+    registration_name: str | None = None,
+    profile_store: ProfileStore | None = None,
+    runtime_settings: RuntimeSettings | None = None,
+) -> RotationResult:
+    if sync_playwright is None:
+        raise InflowAutomationError(
+            "Модуль playwright не установлен. Выполните: pip install -r requirements.txt"
+        )
+
+    active_settings = _load_runtime_settings(runtime_settings)
+    ads_client = _build_ads_client(active_settings)
+    registration_name = (registration_name or profile.name).strip() or "Inflow User"
+
+    with sync_playwright() as playwright:
+        return _rotate_profile_on_limit(
+            current_profile=profile,
+            registration_name=registration_name,
+            ads_client=ads_client,
+            playwright=playwright,
+            profile_store=profile_store,
+            runtime_settings=active_settings,
+            delete_old_profile=True,
+        )
+
+
 def run_inbox_check(profile: Profile, target_email: str) -> RunStats:
     if sync_playwright is None:
         raise InflowAutomationError(
@@ -999,7 +1073,7 @@ def run_inbox_check(profile: Profile, target_email: str) -> RunStats:
     ensure_input_files()
     subject, message = load_message_data()
 
-    ads_client = AdsApiClient()
+    ads_client = _build_ads_client(RuntimeSettingsStore().load())
     ads_session = None
     last_error: str | None = None
 

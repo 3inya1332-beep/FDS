@@ -10,10 +10,12 @@ from inflow_automation import (
     InflowAutomationError,
     ensure_input_files,
     get_dashboard_stats,
+    register_new_account_for_profile,
     run_inbox_check,
     run_job,
 )
 from profile_store import Profile, ProfileStore
+from runtime_settings import RuntimeSettingsStore
 
 
 def clear_console() -> None:
@@ -68,6 +70,86 @@ def ask_int(prompt: str) -> int | None:
     return int(raw)
 
 
+def ask_yes_no(prompt: str, *, default: bool = False) -> bool:
+    raw = input(prompt).strip().lower()
+    if not raw:
+        return default
+    return raw in {"y", "yes", "1", "да", "д"}
+
+
+def _mask_secret(value: str) -> str:
+    value = value.strip()
+    if not value:
+        return "(пусто)"
+    if len(value) <= 6:
+        return "*" * len(value)
+    return f"{value[:3]}***{value[-2:]}"
+
+
+def show_api_settings(settings_store: RuntimeSettingsStore) -> None:
+    settings = settings_store.load()
+    proxy_line = (
+        f"{settings.proxy_type}://{settings.proxy_host}:{settings.proxy_port}"
+        if settings.proxy_enabled and settings.proxy_host and settings.proxy_port
+        else "выключен"
+    )
+    lines = [
+        f"ADS API BASE: {settings.ads_api_base}",
+        f"ADS API KEY: {_mask_secret(settings.ads_api_key)}",
+        f"ANYMESSAGE API BASE: {settings.anymessage_api_base}",
+        f"ANYMESSAGE TOKEN: {_mask_secret(settings.anymessage_api_token)}",
+        f"ANYMESSAGE SERVICE: {settings.anymessage_service}",
+        f"PROXY: {proxy_line}",
+        f"PROXY USER: {_mask_secret(settings.proxy_username)}",
+    ]
+    _print_box(lines, title="API / PROXY SETTINGS")
+
+
+def setup_api_flow(settings_store: RuntimeSettingsStore) -> None:
+    settings = settings_store.load()
+    print("\n⚙️ НАСТРОЙКА API (ADS + PROXY + ANYMESSAGE)")
+
+    settings.ads_api_base = input(f"ADS API BASE [{settings.ads_api_base}]: ").strip() or settings.ads_api_base
+
+    ads_key = input(f"ADS API KEY [{_mask_secret(settings.ads_api_key)}]: ").strip()
+    if ads_key:
+        settings.ads_api_key = ads_key
+
+    settings.anymessage_api_base = (
+        input(f"ANYMESSAGE API BASE [{settings.anymessage_api_base}]: ").strip() or settings.anymessage_api_base
+    )
+
+    anymessage_token = input(f"ANYMESSAGE TOKEN [{_mask_secret(settings.anymessage_api_token)}]: ").strip()
+    if anymessage_token:
+        settings.anymessage_api_token = anymessage_token
+
+    settings.anymessage_service = input(f"ANYMESSAGE SERVICE [{settings.anymessage_service}]: ").strip() or settings.anymessage_service
+
+    settings.proxy_enabled = ask_yes_no(
+        f"Включить PROXY? [{'Y/n' if settings.proxy_enabled else 'y/N'}]: ",
+        default=settings.proxy_enabled,
+    )
+    if settings.proxy_enabled:
+        settings.proxy_type = input(f"PROXY TYPE [{settings.proxy_type}]: ").strip() or settings.proxy_type
+        settings.proxy_host = input(f"PROXY HOST [{settings.proxy_host}]: ").strip() or settings.proxy_host
+        settings.proxy_port = input(f"PROXY PORT [{settings.proxy_port}]: ").strip() or settings.proxy_port
+        settings.proxy_username = input(f"PROXY USER [{settings.proxy_username}]: ").strip() or settings.proxy_username
+        proxy_pass = input(
+            f"PROXY PASS [{'***' if settings.proxy_password else '(пусто)'}]: "
+        ).strip()
+        if proxy_pass:
+            settings.proxy_password = proxy_pass
+    else:
+        settings.proxy_type = "http"
+        settings.proxy_host = ""
+        settings.proxy_port = ""
+        settings.proxy_username = ""
+        settings.proxy_password = ""
+
+    settings_store.save(settings)
+    print("✅ Настройки API сохранены.")
+
+
 def add_profile_flow(store: ProfileStore) -> None:
     print("\n➕ Добавление ADS профиля")
     name = input("Название профиля (любое): ").strip()
@@ -98,7 +180,7 @@ def delete_profile_flow(store: ProfileStore) -> None:
         print("⚠️ Профиль не найден.")
 
 
-def run_flow(store: ProfileStore) -> None:
+def run_flow(store: ProfileStore, settings_store: RuntimeSettingsStore) -> None:
     profiles = list(store.list_profiles())
     print_profiles(profiles)
     if not profiles:
@@ -117,10 +199,18 @@ def run_flow(store: ProfileStore) -> None:
     registration_name = input(
         f"Имя для регистрации нового Inflow-аккаунта при лимите [{profile.name}]: "
     ).strip() or profile.name
+    register_before_send = ask_yes_no("Сначала зарегистрировать новый аккаунт перед отправкой? [y/N]: ", default=False)
+    runtime_settings = settings_store.load()
 
     print("\n🚀 Запускаю автоматизацию...")
     try:
-        stats = run_job(profile, registration_name=registration_name, profile_store=store)
+        stats = run_job(
+            profile,
+            registration_name=registration_name,
+            profile_store=store,
+            runtime_settings=runtime_settings,
+            register_before_send=register_before_send,
+        )
         lines = [
             "🎉 Готово",
             f"Всего email во входном файле: {stats.total_input_emails}",
@@ -135,6 +225,45 @@ def run_flow(store: ProfileStore) -> None:
         _print_box(lines, title="ОТЧЕТ ЗАПУСКА")
     except (AdsApiError, InflowAutomationError) as exc:
         _print_box([f"Ошибка запуска: {exc}"], title="ОШИБКА")
+
+
+def register_flow(store: ProfileStore, settings_store: RuntimeSettingsStore) -> None:
+    profiles = list(store.list_profiles())
+    print_profiles(profiles)
+    if not profiles:
+        print("⚠️ Сначала добавьте профиль.")
+        return
+
+    selected = ask_int("Введите локальный ID профиля для регистрации нового аккаунта: ")
+    if selected is None:
+        return
+    profile = store.get_profile(selected)
+    if profile is None:
+        print("⚠️ Профиль не найден.")
+        return
+
+    registration_name = input(f"Имя для регистрации [{profile.name}]: ").strip() or profile.name
+    runtime_settings = settings_store.load()
+
+    print("\n🆕 Запускаю регистрацию нового аккаунта...")
+    try:
+        result = register_new_account_for_profile(
+            profile=profile,
+            registration_name=registration_name,
+            profile_store=store,
+            runtime_settings=runtime_settings,
+        )
+        updated = store.get_profile(selected)
+        lines = [
+            "Регистрация завершена.",
+            f"Новый ADS profile id: {result.new_profile_id}",
+            f"Новый Purchase Order URL: {result.new_start_url}",
+        ]
+        if updated is not None:
+            lines.append(f"Профиль [{updated.local_id}] обновлен в базе.")
+        _print_box(lines, title="РЕГИСТРАЦИЯ ГОТОВА")
+    except (AdsApiError, InflowAutomationError) as exc:
+        _print_box([f"Ошибка регистрации: {exc}"], title="ОШИБКА")
 
 
 def inbox_check_flow(store: ProfileStore) -> None:
@@ -173,6 +302,7 @@ def inbox_check_flow(store: ProfileStore) -> None:
 
 def show_menu() -> None:
     store = ProfileStore()
+    settings_store = RuntimeSettingsStore()
     ensure_input_files()
 
     while True:
@@ -184,7 +314,10 @@ def show_menu() -> None:
         print("3. Удалить профиль")
         print("4. Запустить отправку Purchase Order")
         print("5. Проверка инбокса (одноразовая отправка)")
-        print("6. Выход")
+        print("6. Регистрация нового аккаунта (без отправки)")
+        print("7. Показать API/PROXY настройки")
+        print("8. Выход")
+        print("9. Настройка API (PROXY + ANYMESSAGE)")
         choice = input("\n👉 Выберите действие: ").strip()
 
         if choice == "1":
@@ -198,13 +331,22 @@ def show_menu() -> None:
             delete_profile_flow(store)
         elif choice == "4":
             clear_console()
-            run_flow(store)
+            run_flow(store, settings_store)
         elif choice == "5":
             clear_console()
             inbox_check_flow(store)
         elif choice == "6":
+            clear_console()
+            register_flow(store, settings_store)
+        elif choice == "7":
+            clear_console()
+            show_api_settings(settings_store)
+        elif choice == "8":
             print("👋 Выход.")
             break
+        elif choice == "9":
+            clear_console()
+            setup_api_flow(settings_store)
         else:
             print("⚠️ Неизвестный пункт меню.")
 

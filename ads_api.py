@@ -261,16 +261,58 @@ class AdsApiClient:
                         return str(item_value).strip()
         return None
 
-    def create_profile(self, name: str) -> str:
+    @staticmethod
+    def _apply_proxy_payload(base_payload: dict[str, Any], proxy_config: dict[str, str] | None) -> dict[str, Any]:
+        payload = dict(base_payload)
+        if not proxy_config:
+            return payload
+
+        proxy_type = proxy_config.get("proxy_type", "http")
+        proxy_host = proxy_config.get("proxy_host", "")
+        proxy_port = proxy_config.get("proxy_port", "")
+        proxy_user = proxy_config.get("proxy_username", "")
+        proxy_pass = proxy_config.get("proxy_password", "")
+
+        if not proxy_host or not proxy_port:
+            return payload
+
+        payload.update(
+            {
+                "proxy_type": proxy_type,
+                "proxy_host": proxy_host,
+                "proxy_port": proxy_port,
+                "proxy_username": proxy_user,
+                "proxy_password": proxy_pass,
+                "proxy_user": proxy_user,
+                "proxy_pass": proxy_pass,
+            }
+        )
+        proxy_object = {
+            "proxy_type": proxy_type,
+            "host": proxy_host,
+            "port": proxy_port,
+            "username": proxy_user,
+            "password": proxy_pass,
+        }
+        payload["proxy"] = proxy_object
+        payload["proxy_config"] = proxy_object
+        payload["user_proxy_config"] = proxy_object
+        return payload
+
+    def create_profile(self, name: str, proxy_config: dict[str, str] | None = None) -> str:
         profile_name = name.strip()
         if not profile_name:
             raise AdsApiError("ADS profile name cannot be empty.")
 
+        payload_name = self._apply_proxy_payload({"name": profile_name, "group_id": "0"}, proxy_config)
+        payload_user_name = self._apply_proxy_payload({"user_name": profile_name, "group_id": "0"}, proxy_config)
+        payload_profile_name = self._apply_proxy_payload({"name": profile_name}, proxy_config)
+
         create_variants = [
-            ("POST", "/api/v1/user/create", {"json": {"name": profile_name, "group_id": "0"}}),
-            ("POST", "/api/v1/user/create", {"json": {"user_name": profile_name, "group_id": "0"}}),
-            ("POST", "/api/v1/profile/create", {"json": {"name": profile_name}}),
-            ("POST", "/api/v1/profiles/create", {"json": {"name": profile_name}}),
+            ("POST", "/api/v1/user/create", {"json": payload_name}),
+            ("POST", "/api/v1/user/create", {"json": payload_user_name}),
+            ("POST", "/api/v1/profile/create", {"json": payload_profile_name}),
+            ("POST", "/api/v1/profiles/create", {"json": payload_profile_name}),
             ("GET", "/api/v1/user/create", {"params": {"name": profile_name, "group_id": "0"}}),
             ("GET", "/api/v1/profile/create", {"params": {"name": profile_name}}),
         ]

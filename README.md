@@ -29,6 +29,7 @@
 - `main.py` — консольное меню запуска.
 - `config.py` — настройки ADS API и поведения скрипта.
 - `ads_api.py` — запросы к локальному ADS API.
+- `runtime_settings.py` — runtime-настройки API/Proxy (файл `runtime_settings.json`).
 - `profile_store.py` — база профилей (`sqlite`).
 - `inflow_automation.py` — действия в интерфейсе Inflow через Playwright.
 - `edit/SUBJECT.txt` — тема письма.
@@ -43,7 +44,12 @@ pip install -r requirements.txt
 
 ## Настройка
 
-Откройте `config.py` и укажите:
+Есть 2 способа настройки:
+
+1) Через меню (рекомендуется): пункт `9. Настройка API (PROXY + ANYMESSAGE)`  
+   Значения сохраняются в `runtime_settings.json`.
+
+2) Через `config.py` (дефолты, если `runtime_settings.json` нет):
 
 - `LOCAL_API_BASE` (обычно `http://127.0.0.1:50325`)
 - `API_KEY` (если используется вашей версией ADS)
@@ -62,8 +68,9 @@ python main.py
 В меню:
 
 1. Добавьте профиль ADS (введите `ADS profile id` и URL).
-2. Выберите запуск автоматизации и укажите имя для регистрации нового аккаунта
-   (будет использовано, если сработает лимит `Maximum emails exceeded`).
+2. Пункт `4` — запуск отправки (можно выбрать режим: сначала зарегистрировать, потом отправлять).
+3. Пункт `6` — отдельная ручная регистрация нового аккаунта (без отправки).
+4. Пункт `9` — отдельная настройка API: ADS API + Proxy + AnyMessage.
 
 ## Важно
 
