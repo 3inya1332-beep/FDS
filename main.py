@@ -4,14 +4,14 @@ import sqlite3
 from typing import Iterable
 
 from ads_api import AdsApiError
-from config import DEFAULT_PCLOUD_URL
-from pcloud_automation import PcloudAutomationError, ensure_input_files, run_job
+from config import DEFAULT_INFLOW_URL
+from inflow_automation import InflowAutomationError, ensure_input_files, run_job
 from profile_store import Profile, ProfileStore
 
 
 def print_header() -> None:
     print("\n" + "=" * 60)
-    print("                 ADS + pCloud AUTO INVITER")
+    print("              ADS + INFLOW PURCHASE ORDER SENDER")
     print("=" * 60)
 
 
@@ -41,7 +41,7 @@ def add_profile_flow(store: ProfileStore) -> None:
     print("\nДобавление ADS профиля")
     name = input("Название профиля (любое): ").strip()
     ads_profile_id = input("ADS profile id: ").strip()
-    start_url = input(f"URL старта [{DEFAULT_PCLOUD_URL}]: ").strip() or DEFAULT_PCLOUD_URL
+    start_url = input(f"URL старта [{DEFAULT_INFLOW_URL}]: ").strip() or DEFAULT_INFLOW_URL
 
     if not name or not ads_profile_id:
         print("Название и ADS profile id обязательны.")
@@ -88,9 +88,11 @@ def run_flow(store: ProfileStore) -> None:
         stats = run_job(profile)
         print("\nГотово:")
         print(f"  Всего email: {stats.total_emails}")
-        print(f"  Отправлено: {stats.sent_emails}")
-        print(f"  Ошибочных батчей: {stats.failed_batches}")
-    except (AdsApiError, PcloudAutomationError) as exc:
+        print(f"  Всего отправок (по 3 email): {stats.total_orders}")
+        print(f"  Успешных отправок: {stats.sent_orders}")
+        print(f"  Ошибочных отправок: {stats.failed_orders}")
+        print(f"  Пропущено email (остаток < 3): {stats.skipped_emails}")
+    except (AdsApiError, InflowAutomationError) as exc:
         print(f"Ошибка запуска: {exc}")
 
 
@@ -103,7 +105,7 @@ def show_menu() -> None:
         print("1. Добавить профиль ADS Browser")
         print("2. Показать профили")
         print("3. Удалить профиль")
-        print("4. Запустить создание folder + invite emails")
+        print("4. Запустить отправку Purchase Order через Email")
         print("5. Выход")
         choice = input("\nВыберите действие: ").strip()
 
