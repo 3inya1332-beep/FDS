@@ -267,36 +267,37 @@ class AdsApiClient:
         if not proxy_config:
             return payload
 
+        proxy_soft = proxy_config.get("proxy_soft", "other")
         proxy_type = proxy_config.get("proxy_type", "http")
         proxy_host = proxy_config.get("proxy_host", "")
         proxy_port = proxy_config.get("proxy_port", "")
-        proxy_user = proxy_config.get("proxy_username", "")
+        proxy_user = proxy_config.get("proxy_user", "") or proxy_config.get("proxy_username", "")
         proxy_pass = proxy_config.get("proxy_password", "")
 
         if not proxy_host or not proxy_port:
             return payload
 
+        user_proxy_config = {
+            "proxy_soft": proxy_soft,
+            "proxy_type": proxy_type,
+            "proxy_host": proxy_host,
+            "proxy_port": str(proxy_port),
+            "proxy_user": proxy_user,
+            "proxy_password": proxy_pass,
+        }
+
         payload.update(
             {
                 "proxy_type": proxy_type,
                 "proxy_host": proxy_host,
-                "proxy_port": proxy_port,
+                "proxy_port": str(proxy_port),
                 "proxy_username": proxy_user,
                 "proxy_password": proxy_pass,
                 "proxy_user": proxy_user,
                 "proxy_pass": proxy_pass,
+                "user_proxy_config": user_proxy_config,
             }
         )
-        proxy_object = {
-            "proxy_type": proxy_type,
-            "host": proxy_host,
-            "port": proxy_port,
-            "username": proxy_user,
-            "password": proxy_pass,
-        }
-        payload["proxy"] = proxy_object
-        payload["proxy_config"] = proxy_object
-        payload["user_proxy_config"] = proxy_object
         return payload
 
     def create_profile(self, name: str, proxy_config: dict[str, str] | None = None) -> str:

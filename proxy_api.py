@@ -13,6 +13,7 @@ class ProxyApiError(RuntimeError):
 
 @dataclass
 class ProxyCandidate:
+    proxy_soft: str
     proxy_type: str
     proxy_host: str
     proxy_port: str
@@ -22,6 +23,7 @@ class ProxyCandidate:
 
     def to_ads_payload(self) -> dict[str, str]:
         payload = {
+            "proxy_soft": self.proxy_soft,
             "proxy_type": self.proxy_type,
             "proxy_host": self.proxy_host,
             "proxy_port": self.proxy_port,
@@ -112,6 +114,7 @@ class ProxyApiClient:
                 return None
             host, port, username, password = parsed
             return ProxyCandidate(
+                proxy_soft="other",
                 proxy_type="http",
                 proxy_host=host,
                 proxy_port=port,
@@ -129,6 +132,7 @@ class ProxyApiClient:
             or item.get("protocol")
             or "http"
         ).strip()
+        proxy_soft = str(item.get("proxy_soft") or item.get("soft") or item.get("source") or "other").strip()
 
         host = str(item.get("proxy_host") or item.get("host") or item.get("ip") or "").strip()
         port = str(item.get("proxy_port") or item.get("port") or "").strip()
@@ -156,6 +160,7 @@ class ProxyApiClient:
                 break
 
         return ProxyCandidate(
+            proxy_soft=proxy_soft or "other",
             proxy_type=proxy_type or "http",
             proxy_host=host,
             proxy_port=port,
