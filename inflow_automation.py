@@ -238,8 +238,12 @@ def _resolve_best_proxy(settings: RuntimeSettings) -> dict[str, str] | None:
     else:
         _write_log(f"Proxy selected: {candidate.proxy_host}:{candidate.proxy_port} (ping not provided)")
     payload = candidate.to_ads_payload()
+    payload["proxy_type"] = "http"
     payload["proxy_host"] = PROXY_FORCE_HOST
     payload["proxy_port"] = PROXY_FORCE_PORT
+    payload["proxy_user"] = ""
+    payload["proxy_username"] = ""
+    payload["proxy_password"] = ""
     _write_log(f"Proxy endpoint forced to local gateway: {PROXY_FORCE_HOST}:{PROXY_FORCE_PORT}")
     return payload
 
@@ -738,29 +742,36 @@ class InflowUi:
                 break
 
     def register_new_inflow_account(self, registration_name: str, anymessage_client: AnyMessageClient) -> str:
+        _write_log("Шаг 1/8: Покупка новой почты через AnyMessage.")
         mailbox = anymessage_client.buy_gmail()
         password = _random_password()
         phone = _random_uk_phone()
         _write_log(f"Bought gmail via AnyMessage: {mailbox.email}")
 
+        _write_log("Шаг 2/8: Открываю страницу регистрации Inflow.")
         self.page.goto(INFLOW_SIGNUP_URL, wait_until="domcontentloaded", timeout=90_000)
         self.page.wait_for_load_state("networkidle", timeout=60_000)
 
+        _write_log("Шаг 3/8: Ввожу рабочую почту и продолжаю.")
         self._fill_first_visible_input(mailbox.email, [r"work email", r"email"], timeout_ms=25_000)
         self._click_by_text_patterns([r"continue", r"next"], timeout_ms=20_000)
 
+        _write_log("Шаг 4/8: Заполняю имя, телефон и пароль.")
         self._fill_first_visible_input(registration_name, [r"name", r"full name"], timeout_ms=20_000)
         self._fill_first_visible_input(phone, [r"phone"], timeout_ms=15_000)
         self._fill_first_visible_input(password, [r"password"], timeout_ms=15_000)
         self._click_by_text_patterns([r"continue", r"create", r"sign up"], timeout_ms=20_000)
 
+        _write_log("Шаг 5/8: Прохожу onboarding и активирую trial.")
         self._click_by_text_patterns([r"inflow inventory.*start.*trial", r"start.*trial"], timeout_ms=30_000)
         self._click_by_text_patterns([r"continue"], timeout_ms=20_000)
         self._click_by_text_patterns([r"skip this step", r"skip"], timeout_ms=20_000)
         self._click_by_text_patterns([r"start your free trial.*14", r"start.*free.*trial"], timeout_ms=40_000)
 
+        _write_log("Шаг 6/8: Создаю первый Purchase Order.")
         first_purchase_url = self._create_purchase_order(vendor_required=False)
 
+        _write_log("Шаг 7/8: Жду письмо подтверждения и подтверждаю почту.")
         confirm_url = anymessage_client.wait_inflow_confirmation_link(mailbox)
         _write_log(f"Inflow confirmation URL found: {confirm_url}")
         self.page.goto(confirm_url, wait_until="domcontentloaded", timeout=90_000)
@@ -774,6 +785,7 @@ class InflowUi:
         except Exception as exc:  # noqa: BLE001
             _write_log(f"Company switch flow was not required or failed softly: {exc}")
 
+        _write_log("Шаг 8/8: Создаю финальный Purchase Order для дальнейшей отправки.")
         second_purchase_url = self._create_purchase_order(vendor_required=True)
         return second_purchase_url
 
@@ -1152,3 +1164,4 @@ def _write_log(message: str) -> None:
     log_file = LOGS_DIR / "automation.log"
     with log_file.open("a", encoding="utf-8") as file:
         file.write(f"[{timestamp}] {message}\n")
+    print(f"[{timestamp}] {message}")

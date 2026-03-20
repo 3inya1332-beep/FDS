@@ -20,10 +20,12 @@ AUTO_REREGISTER_TRY_LIMIT = 1
 UK_PHONE_DIGITS = 11
 
 # AnyMessage API
-ANYMESSAGE_API_BASE = "https://api.anymessage.example"
+ANYMESSAGE_API_BASE = "https://api.anymessage.shop"
 ANYMESSAGE_API_TOKEN = "CmeCiBaS3fAgAXoGYTYS6l3x2k0Kowyc"
 ANYMESSAGE_TIMEOUT_SECONDS = 60
 ANYMESSAGE_SERVICE = "gmail"
+ANYMESSAGE_SITE = "https://accounts.inflowinventory.com/signup"
+ANYMESSAGE_DOMAIN = "mailcom,gmx,hotmail,outlook"
 ANYMESSAGE_PURCHASE_PATHS = (
     "/api/v1/mail/buy",
     "/api/v1/emails/buy",

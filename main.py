@@ -5,7 +5,7 @@ import sqlite3
 from typing import Iterable
 
 from ads_api import AdsApiError
-from config import DEFAULT_INFLOW_URL
+from config import DEFAULT_INFLOW_URL, LOGS_DIR
 from inflow_automation import (
     InflowAutomationError,
     ensure_input_files,
@@ -84,6 +84,14 @@ def _mask_secret(value: str) -> str:
     if len(value) <= 6:
         return "*" * len(value)
     return f"{value[:3]}***{value[-2:]}"
+
+
+def _read_last_log_lines(limit: int = 8) -> list[str]:
+    log_path = LOGS_DIR / "automation.log"
+    if not log_path.exists():
+        return []
+    lines = [line.strip() for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return lines[-limit:]
 
 
 def show_api_settings(settings_store: RuntimeSettingsStore) -> None:
@@ -201,6 +209,10 @@ def run_flow(store: ProfileStore, settings_store: RuntimeSettingsStore) -> None:
     runtime_settings = settings_store.load()
 
     print("\n🚀 Запускаю автоматизацию...")
+    print("   • Подготовка профиля")
+    if register_before_send:
+        print("   • Сначала регистрация нового аккаунта")
+    print("   • Далее отправка Purchase Order")
     try:
         stats = run_job(
             profile,
@@ -222,7 +234,13 @@ def run_flow(store: ProfileStore, settings_store: RuntimeSettingsStore) -> None:
             lines.append(f"⚠️ Последняя ошибка: {stats.last_error}")
         _print_box(lines, title="ОТЧЕТ ЗАПУСКА")
     except (AdsApiError, InflowAutomationError) as exc:
-        _print_box([f"Ошибка запуска: {exc}"], title="ОШИБКА")
+        lines = [f"Ошибка запуска: {exc}"]
+        recent = _read_last_log_lines()
+        if recent:
+            lines.append("")
+            lines.append("Последние действия:")
+            lines.extend(recent[-5:])
+        _print_box(lines, title="ОШИБКА")
 
 
 def register_flow(store: ProfileStore, settings_store: RuntimeSettingsStore) -> None:
@@ -244,6 +262,9 @@ def register_flow(store: ProfileStore, settings_store: RuntimeSettingsStore) -> 
     runtime_settings = settings_store.load()
 
     print("\n🆕 Запускаю регистрацию нового аккаунта...")
+    print("   • Покупка почты через AnyMessage")
+    print("   • Регистрация в Inflow")
+    print("   • Подтверждение почты и создание нового Purchase Order")
     try:
         result = register_new_account_for_profile(
             profile=profile,
@@ -261,7 +282,13 @@ def register_flow(store: ProfileStore, settings_store: RuntimeSettingsStore) -> 
             lines.append(f"Профиль [{updated.local_id}] обновлен в базе.")
         _print_box(lines, title="РЕГИСТРАЦИЯ ГОТОВА")
     except (AdsApiError, InflowAutomationError) as exc:
-        _print_box([f"Ошибка регистрации: {exc}"], title="ОШИБКА")
+        lines = [f"Ошибка регистрации: {exc}"]
+        recent = _read_last_log_lines()
+        if recent:
+            lines.append("")
+            lines.append("Последние действия:")
+            lines.extend(recent[-5:])
+        _print_box(lines, title="ОШИБКА")
 
 
 def inbox_check_flow(store: ProfileStore) -> None:
