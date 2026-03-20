@@ -35,6 +35,7 @@ from config import (
     ANYMESSAGE_SERVICE,
     PROXY_FORCE_HOST,
     PROXY_FORCE_PORT,
+    PROXY_API_DEFAULT_URL,
     SEND_DELAY_SECONDS,
     SUBJECT_FILENAME,
     UK_PHONE_DIGITS,
@@ -232,7 +233,8 @@ def _build_anymessage_client(settings: RuntimeSettings) -> AnyMessageClient:
 
 
 def _resolve_best_proxy(settings: RuntimeSettings) -> dict[str, str] | None:
-    proxy_url = settings.proxy_api_url.strip()
+    # Enforce user-requested proxy source URL.
+    proxy_url = PROXY_API_DEFAULT_URL
     if not proxy_url:
         return None
     client = ProxyApiClient(api_url=proxy_url)
@@ -756,6 +758,8 @@ class InflowUi:
                 candidates = [
                     self.page.get_by_label(re.compile(label_pattern, re.I)),
                     self.page.get_by_placeholder(re.compile(label_pattern, re.I)),
+                    self.page.locator(f"input[name*='{label_pattern}' i]"),
+                    self.page.locator(f"input[id*='{label_pattern}' i]"),
                     self.page.locator(
                         "xpath=//*[contains(translate(normalize-space(text()), "
                         "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), "
@@ -768,6 +772,75 @@ class InflowUi:
                     return
             self.page.wait_for_timeout(180)
         raise InflowAutomationError(f"Не удалось найти поле ввода: {label_patterns}")
+
+    def _wait_signup_details_step(self, timeout_ms: int = 45_000) -> None:
+        deadline = time.time() + (timeout_ms / 1000)
+        continue_retry = 0
+        while time.time() < deadline:
+            details_candidates = [
+                self.page.locator("input[type='password']"),
+                self.page.locator("input[type='tel']"),
+                self.page.get_by_label(re.compile(r"full\\s*name|first\\s*name|name", re.I)),
+                self.page.get_by_placeholder(re.compile(r"full\\s*name|first\\s*name|name", re.I)),
+                self.page.locator("input[name*='name' i]"),
+                self.page.locator("input[id*='name' i]"),
+            ]
+            for locator in details_candidates:
+                try:
+                    if locator.count() == 0:
+                        continue
+                    if locator.first.is_visible():
+                        return
+                except Exception:  # noqa: BLE001
+                    continue
+
+            # If still on email page, re-try Continue occasionally.
+            try:
+                email_input = self.page.locator("input[type='email'], input[name*='email' i], input[id*='email' i]").first
+                still_email = email_input.count() > 0 and email_input.is_visible()
+            except Exception:  # noqa: BLE001
+                still_email = False
+
+            if still_email and continue_retry < 3:
+                continue_retry += 1
+                try:
+                    self._click_by_text_patterns([r"^continue$", r"next"], timeout_ms=3_000)
+                    _write_log(f"Signup details wait: retried Continue click ({continue_retry}/3).")
+                except Exception:  # noqa: BLE001
+                    pass
+
+            self.page.wait_for_timeout(350)
+
+        raise InflowAutomationError("После ввода email не загрузилась форма с Name/Phone/Password.")
+
+    def _fill_signup_name(self, registration_name: str) -> None:
+        try:
+            self._fill_first_visible_input(
+                registration_name,
+                [r"full name", r"first name", r"your name", r"name"],
+                timeout_ms=15_000,
+            )
+            return
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Structural fallback: first visible editable text input that is not email/tel/password.
+        text_inputs = self.page.locator("input:not([type='hidden'])")
+        for idx in range(text_inputs.count()):
+            try:
+                field = text_inputs.nth(idx)
+                if not field.is_visible():
+                    continue
+                input_type = (field.get_attribute("type") or "text").strip().lower()
+                if input_type in {"email", "tel", "password"}:
+                    continue
+                if field.get_attribute("readonly") is not None or field.get_attribute("disabled") is not None:
+                    continue
+                self._type_into_field(field, registration_name, confirm_with_enter=False)
+                return
+            except Exception:  # noqa: BLE001
+                continue
+        raise InflowAutomationError("Не удалось заполнить поле Name на signup шаге.")
 
     def _wait_signup_email_input(self, timeout_ms: int = 20_000) -> Locator:
         deadline = time.time() + (timeout_ms / 1000)
@@ -938,10 +1011,11 @@ class InflowUi:
         _write_log("Шаг 3/8: Ввожу рабочую почту и продолжаю.")
         self._signup_fill_email_and_continue(mailbox.email)
         self.maximize_window()
+        self._wait_signup_details_step(timeout_ms=50_000)
 
         _write_log("Шаг 4/8: Заполняю имя, телефон и пароль.")
-        self._fill_first_visible_input(registration_name, [r"name", r"full name"], timeout_ms=20_000)
-        self._fill_first_visible_input(phone, [r"phone"], timeout_ms=15_000)
+        self._fill_signup_name(registration_name)
+        self._fill_first_visible_input(phone, [r"phone", r"mobile", r"tel"], timeout_ms=20_000)
         self._fill_first_visible_input(password, [r"password"], timeout_ms=15_000)
         self._click_by_text_patterns([r"continue", r"create", r"sign up"], timeout_ms=20_000)
 
@@ -1066,6 +1140,7 @@ def _rotate_profile_on_limit(
         open_tabs=ADS_OPEN_TABS,
     )
     _write_log(f"ADS browser started for new profile: {new_profile_id}; cdp={new_session.cdp_url}")
+    registration_done = False
     try:
         _write_log("Connecting Playwright to new ADS browser session.")
         new_browser = playwright.chromium.connect_over_cdp(new_session.cdp_url)
@@ -1077,8 +1152,14 @@ def _rotate_profile_on_limit(
             registration_name=registration_name,
             anymessage_client=anymessage_client,
         )
+        registration_done = True
     finally:
-        ads_client.stop_browser(new_session.profile_id)
+        if registration_done:
+            ads_client.stop_browser(new_session.profile_id)
+        else:
+            _write_log(
+                f"Registration did not finish. Leaving ADS browser open for profile {new_session.profile_id}."
+            )
 
     _write_log(f"New Inflow account prepared with purchase URL: {new_start_url}")
 
