@@ -85,6 +85,12 @@ def _exc_text(exc: BaseException) -> str:
     return f"{exc.__class__.__name__}: {exc!r}"
 
 
+def _slug(text: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9_-]+", "_", text.strip())
+    cleaned = re.sub(r"_+", "_", cleaned).strip("_")
+    return cleaned or "step"
+
+
 def _resolve_or_create_dir(candidates: list[Path]) -> Path:
     for folder in candidates:
         if folder.exists():
@@ -366,6 +372,24 @@ class InflowUi:
 
         self._window_maximized_once = True
 
+    def capture_debug_screenshot(self, tag: str) -> str | None:
+        screenshots_dir = LOGS_DIR / "screenshots"
+        screenshots_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"{time.strftime('%Y%m%d_%H%M%S')}_{_slug(tag)}.png"
+        file_path = screenshots_dir / filename
+        try:
+            self.page.screenshot(path=str(file_path), full_page=True, timeout=8_000)
+            _write_log(f"AUTO-SCREENSHOT: {file_path}")
+            return str(file_path)
+        except Exception:  # noqa: BLE001
+            try:
+                self.page.screenshot(path=str(file_path), timeout=8_000)
+                _write_log(f"AUTO-SCREENSHOT: {file_path}")
+                return str(file_path)
+            except Exception as exc:  # noqa: BLE001
+                _write_log(f"Auto-screenshot failed for {tag}: {exc}")
+                return None
+
     def wait_until_ready(self, timeout_ms: int = 60_000) -> None:
         deadline = time.time() + (timeout_ms / 1000)
         while time.time() < deadline:
@@ -428,8 +452,11 @@ class InflowUi:
                 )
                 self._recover_navigation_page()
                 self.page.wait_for_timeout(700 + attempt * 150)
+        screenshot_path = self.capture_debug_screenshot(f"nav_fail_{description}")
+        screenshot_note = f" | screenshot: {screenshot_path}" if screenshot_path else ""
         raise InflowAutomationError(
-            f"Не удалось открыть {description} после {attempts} попыток. Последняя ошибка: {last_error}"
+            f"Не удалось открыть {description} после {attempts} попыток. "
+            f"Последняя ошибка: {last_error}{screenshot_note}"
         )
 
     def open_page(self, url: str) -> None:
@@ -987,80 +1014,85 @@ class InflowUi:
                 break
 
     def register_new_inflow_account(self, registration_name: str, anymessage_client: AnyMessageClient) -> str:
-        _write_log("Шаг 1/8: Покупка новой почты через AnyMessage.")
-        mailbox = anymessage_client.buy_gmail()
-        password = _random_password()
-        phone = _random_uk_phone()
-        _write_log(f"Bought gmail via AnyMessage: {mailbox.email}")
-
-        _write_log("Шаг 2/8: Открываю страницу регистрации Inflow.")
-        self._goto_with_retries(
-            INFLOW_SIGNUP_URL,
-            description="страницу регистрации Inflow",
-            attempts=5,
-            wait_until="commit",
-            timeout_ms=35_000,
-        )
-        # Avoid long hangs on networkidle (tracking/telemetry can keep connections open).
         try:
-            self.page.wait_for_load_state("load", timeout=12_000)
-        except Exception:  # noqa: BLE001
-            pass
-        self.maximize_window()
+            _write_log("Шаг 1/8: Покупка новой почты через AnyMessage.")
+            mailbox = anymessage_client.buy_gmail()
+            password = _random_password()
+            phone = _random_uk_phone()
+            _write_log(f"Bought gmail via AnyMessage: {mailbox.email}")
 
-        _write_log("Шаг 3/8: Ввожу рабочую почту и продолжаю.")
-        self._signup_fill_email_and_continue(mailbox.email)
-        self.maximize_window()
-        self._wait_signup_details_step(timeout_ms=50_000)
+            _write_log("Шаг 2/8: Открываю страницу регистрации Inflow.")
+            self._goto_with_retries(
+                INFLOW_SIGNUP_URL,
+                description="страницу регистрации Inflow",
+                attempts=5,
+                wait_until="commit",
+                timeout_ms=35_000,
+            )
+            # Avoid long hangs on networkidle (tracking/telemetry can keep connections open).
+            try:
+                self.page.wait_for_load_state("load", timeout=12_000)
+            except Exception:  # noqa: BLE001
+                pass
+            self.maximize_window()
 
-        _write_log("Шаг 4/8: Заполняю имя, телефон и пароль.")
-        self._fill_signup_name(registration_name)
-        self._fill_first_visible_input(phone, [r"phone", r"mobile", r"tel"], timeout_ms=20_000)
-        self._fill_first_visible_input(password, [r"password"], timeout_ms=15_000)
-        self._click_by_text_patterns([r"continue", r"create", r"sign up"], timeout_ms=20_000)
+            _write_log("Шаг 3/8: Ввожу рабочую почту и продолжаю.")
+            self._signup_fill_email_and_continue(mailbox.email)
+            self.maximize_window()
+            self._wait_signup_details_step(timeout_ms=50_000)
 
-        _write_log("Шаг 5/8: Прохожу onboarding и активирую trial.")
-        self._click_by_text_patterns([r"inflow inventory.*start.*trial", r"start.*trial"], timeout_ms=30_000)
-        self._click_by_text_patterns([r"continue"], timeout_ms=20_000)
-        self._click_by_text_patterns([r"skip this step", r"skip"], timeout_ms=20_000)
-        self._click_by_text_patterns([r"start your free trial.*14", r"start.*free.*trial"], timeout_ms=40_000)
+            _write_log("Шаг 4/8: Заполняю имя, телефон и пароль.")
+            self._fill_signup_name(registration_name)
+            self._fill_first_visible_input(phone, [r"phone", r"mobile", r"tel"], timeout_ms=20_000)
+            self._fill_first_visible_input(password, [r"password"], timeout_ms=15_000)
+            self._click_by_text_patterns([r"continue", r"create", r"sign up"], timeout_ms=20_000)
 
-        _write_log("Шаг 6/8: Создаю первый Purchase Order.")
-        first_purchase_url = self._create_purchase_order(vendor_required=False)
+            _write_log("Шаг 5/8: Прохожу onboarding и активирую trial.")
+            self._click_by_text_patterns([r"inflow inventory.*start.*trial", r"start.*trial"], timeout_ms=30_000)
+            self._click_by_text_patterns([r"continue"], timeout_ms=20_000)
+            self._click_by_text_patterns([r"skip this step", r"skip"], timeout_ms=20_000)
+            self._click_by_text_patterns([r"start your free trial.*14", r"start.*free.*trial"], timeout_ms=40_000)
 
-        _write_log("Шаг 7/8: Жду письмо подтверждения и подтверждаю почту.")
-        confirm_url = anymessage_client.wait_inflow_confirmation_link(mailbox)
-        _write_log(f"Inflow confirmation URL found: {confirm_url}")
-        self._goto_with_retries(
-            confirm_url,
-            description="ссылку подтверждения почты",
-            attempts=4,
-            wait_until="domcontentloaded",
-        )
-        try:
-            self.page.wait_for_load_state("networkidle", timeout=12_000)
-        except Exception:  # noqa: BLE001
-            pass
+            _write_log("Шаг 6/8: Создаю первый Purchase Order.")
+            first_purchase_url = self._create_purchase_order(vendor_required=False)
 
-        self._goto_with_retries(
-            first_purchase_url,
-            description="первый Purchase Order после подтверждения",
-            attempts=4,
-            wait_until="domcontentloaded",
-        )
-        try:
-            self.page.wait_for_load_state("networkidle", timeout=12_000)
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            self.open_purchase_order_modal()
-            self._resolve_company_switch_dialogs()
+            _write_log("Шаг 7/8: Жду письмо подтверждения и подтверждаю почту.")
+            confirm_url = anymessage_client.wait_inflow_confirmation_link(mailbox)
+            _write_log(f"Inflow confirmation URL found: {confirm_url}")
+            self._goto_with_retries(
+                confirm_url,
+                description="ссылку подтверждения почты",
+                attempts=4,
+                wait_until="domcontentloaded",
+            )
+            try:
+                self.page.wait_for_load_state("networkidle", timeout=12_000)
+            except Exception:  # noqa: BLE001
+                pass
+
+            self._goto_with_retries(
+                first_purchase_url,
+                description="первый Purchase Order после подтверждения",
+                attempts=4,
+                wait_until="domcontentloaded",
+            )
+            try:
+                self.page.wait_for_load_state("networkidle", timeout=12_000)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                self.open_purchase_order_modal()
+                self._resolve_company_switch_dialogs()
+            except Exception as exc:  # noqa: BLE001
+                _write_log(f"Company switch flow was not required or failed softly: {exc}")
+
+            _write_log("Шаг 8/8: Создаю финальный Purchase Order для дальнейшей отправки.")
+            second_purchase_url = self._create_purchase_order(vendor_required=True)
+            return second_purchase_url
         except Exception as exc:  # noqa: BLE001
-            _write_log(f"Company switch flow was not required or failed softly: {exc}")
-
-        _write_log("Шаг 8/8: Создаю финальный Purchase Order для дальнейшей отправки.")
-        second_purchase_url = self._create_purchase_order(vendor_required=True)
-        return second_purchase_url
+            screenshot_path = self.capture_debug_screenshot("registration_flow_error")
+            screenshot_note = f" | screenshot: {screenshot_path}" if screenshot_path else ""
+            raise InflowAutomationError(f"{_exc_text(exc)}{screenshot_note}") from exc
 
     def send_purchase_order(
         self,
@@ -1283,6 +1315,8 @@ def run_job(
                                 f"attempt={attempt + 1}/2; TO={to_email}, CC={cc_email}, BCC={bcc_email}; "
                                 f"error={order_exc}"
                             )
+                            if attempt == 1:
+                                ui.capture_debug_screenshot("send_order_attempt_failed")
                             try:
                                 ui.maximize_window()
                                 if not ui.has_send_dialog_open():
