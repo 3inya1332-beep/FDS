@@ -16,6 +16,13 @@
 6. Нажимает `Send`.
 7. Повторяет отправку, пока есть полные тройки email (TO/CC/BCC).
 8. Если email закончились, завершает работу.
+9. Если после `Send` появляется ошибка `Maximum emails exceeded`, запускает авто-регистрацию:
+   - покупает новый Gmail через AnyMessage API,
+   - создает новый ADS профиль,
+   - проходит signup/onboarding в Inflow,
+   - подтверждает почту по письму из AnyMessage,
+   - создает новый Purchase Order URL,
+   - удаляет старый ADS профиль и обновляет локальную запись профиля.
 
 ## Структура
 
@@ -41,6 +48,10 @@ pip install -r requirements.txt
 - `LOCAL_API_BASE` (обычно `http://127.0.0.1:50325`)
 - `API_KEY` (если используется вашей версией ADS)
 - при необходимости `ADS_HEADLESS`, `SEND_DELAY_SECONDS`
+- для авто-регистрации:
+  - `ANYMESSAGE_API_BASE`
+  - `ANYMESSAGE_API_TOKEN`
+  - при необходимости `ANYMESSAGE_*_PATHS`, `ANYMESSAGE_SERVICE`
 
 ## Запуск
 
@@ -51,7 +62,8 @@ python main.py
 В меню:
 
 1. Добавьте профиль ADS (введите `ADS profile id` и URL).
-2. Выберите запуск автоматизации.
+2. Выберите запуск автоматизации и укажите имя для регистрации нового аккаунта
+   (будет использовано, если сработает лимит `Maximum emails exceeded`).
 
 ## Важно
 

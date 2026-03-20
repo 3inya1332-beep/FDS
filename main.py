@@ -114,9 +114,13 @@ def run_flow(store: ProfileStore) -> None:
         print("⚠️ Профиль не найден.")
         return
 
+    registration_name = input(
+        f"Имя для регистрации нового Inflow-аккаунта при лимите [{profile.name}]: "
+    ).strip() or profile.name
+
     print("\n🚀 Запускаю автоматизацию...")
     try:
-        stats = run_job(profile)
+        stats = run_job(profile, registration_name=registration_name, profile_store=store)
         lines = [
             "🎉 Готово",
             f"Всего email во входном файле: {stats.total_input_emails}",

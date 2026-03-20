@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+import secrets
+import string
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,23 +17,32 @@ except ModuleNotFoundError:  # pragma: no cover - handled in runtime check
     sync_playwright = None
 
 from ads_api import AdsApiClient, AdsApiError
+from anymessage_api import AnyMessageApiError, AnyMessageClient
 from config import (
     ADS_HEADLESS,
     ADS_OPEN_TABS,
+    AUTO_REREGISTER_ON_LIMIT,
+    AUTO_REREGISTER_TRY_LIMIT,
     DEFAULT_INFLOW_URL,
     EDIT_DIR_CANDIDATES,
     EMAIL_DIR_CANDIDATES,
     EMAIL_FILENAMES,
+    INFLOW_SIGNUP_URL,
     LOGS_DIR,
     MESSAGE_FILENAME,
     SEND_DELAY_SECONDS,
     SUBJECT_FILENAME,
+    UK_PHONE_DIGITS,
 )
-from profile_store import Profile
+from profile_store import Profile, ProfileStore
 from sent_store import SentEmailStore
 
 
 class InflowAutomationError(RuntimeError):
+    pass
+
+
+class MaximumEmailsExceededError(InflowAutomationError):
     pass
 
 
@@ -51,6 +62,12 @@ class DashboardStats:
     total_input_emails: int
     already_sent_emails: int
     unsent_emails: int
+
+
+@dataclass
+class RotationResult:
+    new_profile_id: str
+    new_start_url: str
 
 
 def _resolve_or_create_dir(candidates: list[Path]) -> Path:
@@ -180,6 +197,24 @@ def get_dashboard_stats() -> DashboardStats:
         already_sent_emails=already_sent,
         unsent_emails=unsent,
     )
+
+
+def _random_password(length: int = 14) -> str:
+    alphabet = string.ascii_letters + string.digits + "!@#$%^&*"
+    if length < 10:
+        length = 10
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+def _random_word(length: int = 8) -> str:
+    alphabet = string.ascii_lowercase
+    return "".join(secrets.choice(alphabet) for _ in range(max(4, length)))
+
+
+def _random_uk_phone(digits: int = UK_PHONE_DIGITS) -> str:
+    digits = max(10, digits)
+    # Typical UK mobile format starts with 07 + 9 digits.
+    return "07" + "".join(secrets.choice(string.digits) for _ in range(digits - 2))
 
 
 class InflowUi:
@@ -548,6 +583,155 @@ class InflowUi:
             self.page.wait_for_timeout(200)
         return False
 
+    def _is_maximum_limit_visible(self) -> bool:
+        candidates = [
+            self.page.get_by_text(re.compile(r"maximum emails exceeded", re.I)),
+            self.page.locator("text=/Maximum emails exceeded/i"),
+            self.page.locator("text=/You have reached the limit of emails you can send/i"),
+        ]
+        for locator in candidates:
+            try:
+                if locator.count() > 0 and locator.first.is_visible():
+                    return True
+            except Exception:  # noqa: BLE001
+                continue
+        return False
+
+    def _wait_for_max_limit_notice(self, timeout_ms: int = 8_000) -> bool:
+        deadline = time.time() + (timeout_ms / 1000)
+        while time.time() < deadline:
+            if self._is_maximum_limit_visible():
+                return True
+            self.page.wait_for_timeout(200)
+        return False
+
+    def _click_by_text_patterns(self, text_patterns: list[str], timeout_ms: int = 15_000) -> None:
+        deadline = time.time() + (timeout_ms / 1000)
+        while time.time() < deadline:
+            for pattern in text_patterns:
+                compiled = re.compile(pattern, re.I)
+                candidates = [
+                    self.page.get_by_role("button", name=compiled),
+                    self.page.get_by_role("link", name=compiled),
+                    self.page.get_by_text(compiled),
+                    self.page.locator(f"text=/{pattern}/i"),
+                ]
+                for locator in candidates:
+                    try:
+                        if locator.count() == 0:
+                            continue
+                        target = locator.first
+                        if not target.is_visible():
+                            continue
+                        target.click()
+                        self.page.wait_for_timeout(250)
+                        return
+                    except Exception:  # noqa: BLE001
+                        continue
+            self.page.wait_for_timeout(220)
+        raise InflowAutomationError(f"Не удалось нажать кнопку по шаблонам: {text_patterns}")
+
+    def _fill_first_visible_input(self, value: str, label_patterns: list[str], *, timeout_ms: int = 15_000) -> None:
+        deadline = time.time() + (timeout_ms / 1000)
+        while time.time() < deadline:
+            for label_pattern in label_patterns:
+                candidates = [
+                    self.page.get_by_label(re.compile(label_pattern, re.I)),
+                    self.page.get_by_placeholder(re.compile(label_pattern, re.I)),
+                    self.page.locator(
+                        "xpath=//*[contains(translate(normalize-space(text()), "
+                        "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), "
+                        f"'{label_pattern.lower()}')]/following::input[1]"
+                    ),
+                ]
+                field = self._first_visible_field(candidates)
+                if field is not None:
+                    self._type_into_field(field, value, confirm_with_enter=False)
+                    return
+            self.page.wait_for_timeout(180)
+        raise InflowAutomationError(f"Не удалось найти поле ввода: {label_patterns}")
+
+    def _wait_url_contains(self, expected_substring: str, timeout_ms: int = 20_000) -> None:
+        deadline = time.time() + (timeout_ms / 1000)
+        needle = expected_substring.lower()
+        while time.time() < deadline:
+            if needle in self.page.url.lower():
+                return
+            self.page.wait_for_timeout(250)
+        raise InflowAutomationError(f"Ожидание URL с '{expected_substring}' превысило timeout.")
+
+    def _create_purchase_order(self, *, vendor_required: bool) -> str:
+        self.page.goto(DEFAULT_INFLOW_URL, wait_until="domcontentloaded", timeout=90_000)
+        self.page.wait_for_load_state("networkidle", timeout=60_000)
+
+        self._click_by_text_patterns([r"new\s*purchase\s*order"], timeout_ms=18_000)
+
+        if vendor_required:
+            self._click_by_text_patterns([r"start with new vendor", r"new vendor"], timeout_ms=12_000)
+
+        random_value = _random_word()
+        self._fill_first_visible_input(random_value, [r"vendor", r"name", r"item", r"product"], timeout_ms=10_000)
+        self._click_by_text_patterns([r"create"], timeout_ms=12_000)
+
+        self._wait_url_contains("/purchase-orders/", timeout_ms=25_000)
+        created_url = self.page.url
+        _write_log(f"Purchase order created: {created_url}")
+        return created_url
+
+    def _resolve_company_switch_dialogs(self) -> None:
+        if self._is_maximum_limit_visible():
+            return
+
+        try:
+            self._click_by_text_patterns([r"switch to your company"], timeout_ms=7_000)
+        except Exception:  # noqa: BLE001
+            pass
+        for _ in range(2):
+            try:
+                self._click_by_text_patterns([r"continue"], timeout_ms=6_000)
+            except Exception:  # noqa: BLE001
+                break
+
+    def register_new_inflow_account(self, registration_name: str, anymessage_client: AnyMessageClient) -> str:
+        mailbox = anymessage_client.buy_gmail()
+        password = _random_password()
+        phone = _random_uk_phone()
+        _write_log(f"Bought gmail via AnyMessage: {mailbox.email}")
+
+        self.page.goto(INFLOW_SIGNUP_URL, wait_until="domcontentloaded", timeout=90_000)
+        self.page.wait_for_load_state("networkidle", timeout=60_000)
+
+        self._fill_first_visible_input(mailbox.email, [r"work email", r"email"], timeout_ms=25_000)
+        self._click_by_text_patterns([r"continue", r"next"], timeout_ms=20_000)
+
+        self._fill_first_visible_input(registration_name, [r"name", r"full name"], timeout_ms=20_000)
+        self._fill_first_visible_input(phone, [r"phone"], timeout_ms=15_000)
+        self._fill_first_visible_input(password, [r"password"], timeout_ms=15_000)
+        self._click_by_text_patterns([r"continue", r"create", r"sign up"], timeout_ms=20_000)
+
+        self._click_by_text_patterns([r"inflow inventory.*start.*trial", r"start.*trial"], timeout_ms=30_000)
+        self._click_by_text_patterns([r"continue"], timeout_ms=20_000)
+        self._click_by_text_patterns([r"skip this step", r"skip"], timeout_ms=20_000)
+        self._click_by_text_patterns([r"start your free trial.*14", r"start.*free.*trial"], timeout_ms=40_000)
+
+        first_purchase_url = self._create_purchase_order(vendor_required=False)
+
+        confirm_url = anymessage_client.wait_inflow_confirmation_link(mailbox)
+        _write_log(f"Inflow confirmation URL found: {confirm_url}")
+        self.page.goto(confirm_url, wait_until="domcontentloaded", timeout=90_000)
+        self.page.wait_for_load_state("networkidle", timeout=60_000)
+
+        self.page.goto(first_purchase_url, wait_until="domcontentloaded", timeout=90_000)
+        self.page.wait_for_load_state("networkidle", timeout=60_000)
+        try:
+            self.open_purchase_order_modal()
+            self._resolve_company_switch_dialogs()
+        except Exception as exc:  # noqa: BLE001
+            _write_log(f"Company switch flow was not required or failed softly: {exc}")
+
+        second_purchase_url = self._create_purchase_order(vendor_required=True)
+        return second_purchase_url
+
     def send_purchase_order(
         self,
         to_email: str,
@@ -576,6 +760,11 @@ class InflowUi:
             "кнопка Send",
         )
 
+        if self._wait_for_max_limit_notice(timeout_ms=5_000):
+            raise MaximumEmailsExceededError(
+                "Maximum emails exceeded: You have reached the limit of emails you can send."
+            )
+
         # After sending, Inflow may show a success popup with "Okay" button.
         # The script must acknowledge it, otherwise next iteration stalls.
         if self._click_okay_if_present(timeout_ms=8_000):
@@ -595,7 +784,61 @@ class InflowUi:
                 ) from exc
 
 
-def run_job(profile: Profile) -> RunStats:
+def _rotate_profile_on_limit(
+    *,
+    current_profile: Profile,
+    registration_name: str,
+    ads_client: AdsApiClient,
+    playwright: Any,
+    profile_store: ProfileStore | None,
+) -> RotationResult:
+    if not AUTO_REREGISTER_ON_LIMIT:
+        raise InflowAutomationError("AUTO_REREGISTER_ON_LIMIT disabled in config.")
+
+    new_ads_name = f"{registration_name.strip() or current_profile.name.strip() or 'inflow'}-{_random_word(6)}"
+    new_profile_id = ads_client.create_profile(new_ads_name)
+    _write_log(f"New ADS profile created: {new_profile_id}")
+
+    anymessage_client = AnyMessageClient()
+    new_session = ads_client.start_browser(
+        profile_id=new_profile_id,
+        headless=ADS_HEADLESS,
+        open_tabs=ADS_OPEN_TABS,
+    )
+    try:
+        new_browser = playwright.chromium.connect_over_cdp(new_session.cdp_url)
+        new_context = new_browser.contexts[0] if new_browser.contexts else new_browser.new_context()
+        new_page = new_context.pages[0] if new_context.pages else new_context.new_page()
+        new_ui = InflowUi(new_page)
+        new_start_url = new_ui.register_new_inflow_account(
+            registration_name=registration_name,
+            anymessage_client=anymessage_client,
+        )
+    finally:
+        ads_client.stop_browser(new_session.profile_id)
+
+    _write_log(f"New Inflow account prepared with purchase URL: {new_start_url}")
+
+    ads_client.delete_profile(current_profile.ads_profile_id)
+    _write_log(f"Old ADS profile deleted: {current_profile.ads_profile_id}")
+
+    if profile_store is not None:
+        updated = profile_store.update_profile_credentials(
+            local_id=current_profile.local_id,
+            ads_profile_id=new_profile_id,
+            start_url=new_start_url,
+        )
+        if not updated:
+            raise InflowAutomationError("Failed to update profile credentials in local DB.")
+
+    return RotationResult(new_profile_id=new_profile_id, new_start_url=new_start_url)
+
+
+def run_job(
+    profile: Profile,
+    registration_name: str | None = None,
+    profile_store: ProfileStore | None = None,
+) -> RunStats:
     if sync_playwright is None:
         raise InflowAutomationError(
             "Модуль playwright не установлен. Выполните: pip install -r requirements.txt"
@@ -606,82 +849,127 @@ def run_job(profile: Profile) -> RunStats:
 
     ads_client = AdsApiClient()
     sent_store = SentEmailStore()
-    ads_session = None
     sent_emails = 0
     failed_emails = 0
     processable_emails = len(triplets) * 3
     skipped_emails = len(emails_all) - already_sent_emails - processable_emails
     last_error: str | None = None
-    fatal_error = False
+    current_profile_id = profile.ads_profile_id
+    current_start_url = profile.start_url or DEFAULT_INFLOW_URL
+    registration_name = (registration_name or profile.name).strip() or "Inflow User"
+    limit_rotations = 0
 
     try:
         _write_log(
             "Job started "
-            f"profile={profile.ads_profile_id}; url={profile.start_url}; "
+            f"profile={profile.ads_profile_id}; url={profile.start_url}; registration_name={registration_name}; "
             f"emails={len(emails_all)}; processable={processable_emails}; "
             f"already_sent={already_sent_emails}; skipped={skipped_emails}"
         )
 
-        ads_session = ads_client.start_browser(
-            profile_id=profile.ads_profile_id,
-            headless=ADS_HEADLESS,
-            open_tabs=ADS_OPEN_TABS,
-        )
-
         with sync_playwright() as playwright:
-            browser = playwright.chromium.connect_over_cdp(ads_session.cdp_url)
-            context = browser.contexts[0] if browser.contexts else browser.new_context()
-            page = context.pages[0] if context.pages else context.new_page()
+            index = 0
+            while index < len(triplets):
+                to_email, cc_email, bcc_email = triplets[index]
+                ads_session = ads_client.start_browser(
+                    profile_id=current_profile_id,
+                    headless=ADS_HEADLESS,
+                    open_tabs=ADS_OPEN_TABS,
+                )
+                session_stopped = False
+                try:
+                    browser = playwright.chromium.connect_over_cdp(ads_session.cdp_url)
+                    context = browser.contexts[0] if browser.contexts else browser.new_context()
+                    page = context.pages[0] if context.pages else context.new_page()
+                    ui = InflowUi(page)
+                    ui.open_page(current_start_url)
 
-            ui = InflowUi(page)
-            ui.open_page(profile.start_url or DEFAULT_INFLOW_URL)
-
-            for to_email, cc_email, bcc_email in triplets:
-                sent_current = False
-                for attempt in range(2):
-                    try:
-                        ui.send_purchase_order(
-                            to_email=to_email,
-                            cc_email=cc_email,
-                            bcc_email=bcc_email,
-                            subject=subject,
-                            message=message,
-                        )
-                        sent_emails += 3
-                        sent_current = True
-                        _write_log(f"Order sent: TO={to_email}, CC={cc_email}, BCC={bcc_email}")
-                        break
-                    except Exception as order_exc:  # noqa: BLE001
-                        last_error = str(order_exc)
-                        _write_log(
-                            "Order attempt failed: "
-                            f"attempt={attempt + 1}/2; TO={to_email}, CC={cc_email}, BCC={bcc_email}; "
-                            f"error={order_exc}"
-                        )
+                    sent_current = False
+                    rotate_requested = False
+                    for attempt in range(2):
                         try:
-                            ui.maximize_window()
-                            if not ui.has_send_dialog_open():
-                                ui.wait_until_ready(timeout_ms=4_000)
-                        except Exception as heal_exc:  # noqa: BLE001
-                            _write_log(f"Recovery wait failed: {heal_exc}")
-                        self_heal_delay = 0.7 + attempt * 0.3
-                        time.sleep(self_heal_delay)
-                if not sent_current:
-                    failed_emails += 3
-                else:
-                    sent_store.mark_many([to_email, cc_email, bcc_email])
-                time.sleep(SEND_DELAY_SECONDS)
+                            ui.send_purchase_order(
+                                to_email=to_email,
+                                cc_email=cc_email,
+                                bcc_email=bcc_email,
+                                subject=subject,
+                                message=message,
+                            )
+                            sent_emails += 3
+                            sent_current = True
+                            _write_log(f"Order sent: TO={to_email}, CC={cc_email}, BCC={bcc_email}")
+                            break
+                        except MaximumEmailsExceededError as limit_exc:
+                            last_error = str(limit_exc)
+                            _write_log(
+                                "Send blocked by account limit. "
+                                f"profile={current_profile_id}; TO={to_email}; attempt={attempt + 1}/2"
+                            )
+                            rotate_requested = True
+                            break
+                        except Exception as order_exc:  # noqa: BLE001
+                            last_error = str(order_exc)
+                            _write_log(
+                                "Order attempt failed: "
+                                f"attempt={attempt + 1}/2; TO={to_email}, CC={cc_email}, BCC={bcc_email}; "
+                                f"error={order_exc}"
+                            )
+                            try:
+                                ui.maximize_window()
+                                if not ui.has_send_dialog_open():
+                                    ui.wait_until_ready(timeout_ms=4_000)
+                            except Exception as heal_exc:  # noqa: BLE001
+                                _write_log(f"Recovery wait failed: {heal_exc}")
+                            self_heal_delay = 0.7 + attempt * 0.3
+                            time.sleep(self_heal_delay)
+
+                    if rotate_requested:
+                        if limit_rotations >= AUTO_REREGISTER_TRY_LIMIT:
+                            raise InflowAutomationError(
+                                f"Reached AUTO_REREGISTER_TRY_LIMIT={AUTO_REREGISTER_TRY_LIMIT}"
+                            )
+                        limit_rotations += 1
+                        ads_client.stop_browser(ads_session.profile_id)
+                        session_stopped = True
+                        rotated = _rotate_profile_on_limit(
+                            current_profile=Profile(
+                                local_id=profile.local_id,
+                                name=profile.name,
+                                ads_profile_id=current_profile_id,
+                                start_url=current_start_url,
+                                created_at=profile.created_at,
+                            ),
+                            registration_name=registration_name,
+                            ads_client=ads_client,
+                            playwright=playwright,
+                            profile_store=profile_store,
+                        )
+                        current_profile_id = rotated.new_profile_id
+                        current_start_url = rotated.new_start_url
+                        time.sleep(1.0)
+                        continue
+
+                    if sent_current:
+                        sent_store.mark_many([to_email, cc_email, bcc_email])
+                    else:
+                        failed_emails += 3
+                    index += 1
+                    time.sleep(SEND_DELAY_SECONDS)
+                finally:
+                    if not session_stopped:
+                        try:
+                            ads_client.stop_browser(ads_session.profile_id)
+                        except Exception:  # noqa: BLE001
+                            pass
     except AdsApiError:
         raise
+    except AnyMessageApiError as exc:
+        last_error = str(exc)
+        raise InflowAutomationError(str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
-        fatal_error = True
         last_error = str(exc)
         raise InflowAutomationError(str(exc)) from exc
     finally:
-        if ads_session is not None and not (fatal_error or failed_emails > 0):
-            ads_client.stop_browser(ads_session.profile_id)
-        elif ads_session is not None:
-            _write_log("Browser left open because there were automation errors.")
         _write_log(
             f"Job finished: total_emails={len(emails_all)}, total_orders={len(triplets)}, "
             f"sent_emails={sent_emails}, failed_emails={failed_emails}, skipped={skipped_emails}"

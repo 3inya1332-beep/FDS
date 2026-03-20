@@ -238,3 +238,83 @@ class AdsApiClient:
                 return
             except Exception:  # noqa: BLE001
                 continue
+
+    @staticmethod
+    def _extract_profile_id(payload: dict[str, Any]) -> str | None:
+        data = AdsApiClient._data_from_payload(payload)
+        id_keys = ("id", "user_id", "userId", "profile_id", "profileId", "serial_number")
+        for key in id_keys:
+            value = data.get(key)
+            if value is not None and str(value).strip():
+                return str(value).strip()
+
+        # Some APIs return created profile in list.
+        for key in ("list", "items", "rows", "profiles"):
+            value = data.get(key)
+            if isinstance(value, list) and value:
+                item = value[0]
+                if not isinstance(item, dict):
+                    continue
+                for id_key in id_keys:
+                    item_value = item.get(id_key)
+                    if item_value is not None and str(item_value).strip():
+                        return str(item_value).strip()
+        return None
+
+    def create_profile(self, name: str) -> str:
+        profile_name = name.strip()
+        if not profile_name:
+            raise AdsApiError("ADS profile name cannot be empty.")
+
+        create_variants = [
+            ("POST", "/api/v1/user/create", {"json": {"name": profile_name, "group_id": "0"}}),
+            ("POST", "/api/v1/user/create", {"json": {"user_name": profile_name, "group_id": "0"}}),
+            ("POST", "/api/v1/profile/create", {"json": {"name": profile_name}}),
+            ("POST", "/api/v1/profiles/create", {"json": {"name": profile_name}}),
+            ("GET", "/api/v1/user/create", {"params": {"name": profile_name, "group_id": "0"}}),
+            ("GET", "/api/v1/profile/create", {"params": {"name": profile_name}}),
+        ]
+
+        errors: list[str] = []
+        for method, path, kwargs in create_variants:
+            try:
+                payload = self._request(method, path, **kwargs)
+                if not self._is_success(payload):
+                    errors.append(str(payload))
+                    continue
+                created_id = self._extract_profile_id(payload)
+                if created_id:
+                    return created_id
+                errors.append(f"Profile id not found in payload: {payload!r}")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{method} {path} failed: {exc}")
+                continue
+
+        raise AdsApiError("Unable to create ADS profile. " + " | ".join(errors))
+
+    def delete_profile(self, profile_id: str) -> None:
+        profile_id = profile_id.strip()
+        if not profile_id:
+            raise AdsApiError("ADS profile id is empty.")
+
+        delete_variants = [
+            ("POST", "/api/v1/user/delete", {"json": {"user_ids": [profile_id]}}),
+            ("POST", "/api/v1/user/delete", {"json": {"profile_ids": [profile_id]}}),
+            ("POST", "/api/v1/user/delete", {"json": {"user_id": profile_id}}),
+            ("POST", "/api/v1/profile/delete", {"json": {"id": profile_id}}),
+            ("POST", "/api/v1/profiles/delete", {"json": {"ids": [profile_id]}}),
+            ("GET", "/api/v1/user/delete", {"params": {"user_id": profile_id}}),
+            ("GET", "/api/v1/user/delete", {"params": {"profile_id": profile_id}}),
+            ("GET", "/api/v1/profile/delete", {"params": {"id": profile_id}}),
+        ]
+        errors: list[str] = []
+        for method, path, kwargs in delete_variants:
+            try:
+                payload = self._request(method, path, **kwargs)
+                if self._is_success(payload):
+                    return
+                errors.append(str(payload))
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{method} {path} failed: {exc}")
+
+        raise AdsApiError("Unable to delete ADS profile. " + " | ".join(errors))

@@ -90,3 +90,16 @@ class ProfileStore:
             cursor = conn.execute("DELETE FROM profiles WHERE id = ?", (local_id,))
             conn.commit()
         return cursor.rowcount > 0
+
+    def update_profile_credentials(self, local_id: int, ads_profile_id: str, start_url: str) -> bool:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE profiles
+                SET ads_profile_id = ?, start_url = ?
+                WHERE id = ?
+                """,
+                (ads_profile_id.strip(), start_url.strip(), local_id),
+            )
+            conn.commit()
+        return cursor.rowcount > 0
