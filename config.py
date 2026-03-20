@@ -21,6 +21,7 @@ SIGNUP_INITIAL_DELAY_SECONDS = 4
 SIGNUP_WAIT_FOREVER_IF_NOT_READY = True
 SIGNUP_POST_EMAIL_WAIT_SECONDS = 20
 SIGNUP_PASSWORD_SWITCH_TIMEOUT_SECONDS = 35
+KEEP_PROFILE_OPEN_AFTER_REGISTRATION = True
 
 # AnyMessage email activation API.
 # Docs reference: https://anymessage.shop/en/docs
@@ -53,6 +54,8 @@ ACTION_SPEED_MULTIPLIER = 0.2
 # Booking settings.
 BOOKING_GUESTS_PER_EVENT = 10
 BOOKING_NAME_PREFIX = "Alex"
+SEND_BETWEEN_BOOKINGS_SECONDS = 2
+SCHEDULE_CONFIRM_EXTRA_WAIT_SECONDS = 2
 
 # Files and directories.
 EDIT_DIR_CANDIDATES = [BASE_DIR / "edit", BASE_DIR / "EDIT"]
@@ -65,6 +68,8 @@ EMAIL_FILENAME = "emails.txt"
 
 PROFILE_DB_PATH = BASE_DIR / "profiles.db"
 LOGS_DIR = BASE_DIR / "logs"
+SENT_EMAILS_DIR = BASE_DIR / "sent-emails"
+SENT_EMAILS_FILENAME = "sent_emails.txt"
 
 # Legacy compatibility (old pCloud module).
 DEFAULT_PCLOUD_URL = "https://my.pcloud.com/"

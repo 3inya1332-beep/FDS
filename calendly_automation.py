@@ -4,6 +4,7 @@ import json
 import random
 import re
 import secrets
+import sqlite3
 import string
 import sys
 import time
@@ -51,8 +52,14 @@ from config import (
     EDIT_DIR_CANDIDATES,
     EMAIL_DIR_CANDIDATES,
     EMAIL_FILENAME,
+    KEEP_PROFILE_OPEN_AFTER_REGISTRATION,
     LOGS_DIR,
+    PROFILE_DB_PATH,
     REGISTRATION_MAX_ATTEMPTS,
+    SCHEDULE_CONFIRM_EXTRA_WAIT_SECONDS,
+    SEND_BETWEEN_BOOKINGS_SECONDS,
+    SENT_EMAILS_DIR,
+    SENT_EMAILS_FILENAME,
     SIGNUP_INITIAL_DELAY_SECONDS,
     SIGNUP_LOAD_CHECK_TIMEOUT_SECONDS,
     SIGNUP_LOAD_MAX_RELOADS,
@@ -229,6 +236,7 @@ def ensure_input_files() -> None:
     email_dir = _resolve_or_create_dir(EMAIL_DIR_CANDIDATES)
     _resolve_or_create_dir(COOKIE_DIR_CANDIDATES)
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    SENT_EMAILS_DIR.mkdir(parents=True, exist_ok=True)
 
     subject_path = edit_dir / SUBJECT_FILENAME
     if not subject_path.exists():
@@ -244,6 +252,10 @@ def ensure_input_files() -> None:
     email_path = email_dir / EMAIL_FILENAME
     if not email_path.exists():
         email_path.write_text("first@example.com\nsecond@example.com\n", encoding="utf-8")
+
+    sent_emails_file = SENT_EMAILS_DIR / SENT_EMAILS_FILENAME
+    if not sent_emails_file.exists():
+        sent_emails_file.write_text("", encoding="utf-8")
 
 
 def _slugify(value: str) -> str:
@@ -301,6 +313,80 @@ def save_email_pool(emails: Iterable[str]) -> None:
     file_path.write_text(content + ("\n" if content else ""), encoding="utf-8")
 
 
+def _sent_emails_file_path() -> Path:
+    SENT_EMAILS_DIR.mkdir(parents=True, exist_ok=True)
+    return SENT_EMAILS_DIR / SENT_EMAILS_FILENAME
+
+
+def _load_sent_emails_file() -> set[str]:
+    path = _sent_emails_file_path()
+    if not path.exists():
+        return set()
+    lines = [line.strip().lower() for line in path.read_text(encoding="utf-8").splitlines()]
+    return {line for line in lines if line}
+
+
+def _append_sent_emails_file(emails: Iterable[str]) -> None:
+    existing = _load_sent_emails_file()
+    new_items = []
+    for email in emails:
+        lowered = email.strip().lower()
+        if lowered and lowered not in existing:
+            new_items.append(lowered)
+            existing.add(lowered)
+    if not new_items:
+        return
+    path = _sent_emails_file_path()
+    with path.open("a", encoding="utf-8") as handle:
+        for email in new_items:
+            handle.write(email + "\n")
+
+
+def _init_sent_emails_db() -> None:
+    with sqlite3.connect(PROFILE_DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sent_emails (
+                email TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+
+
+def _load_sent_emails_db() -> set[str]:
+    _init_sent_emails_db()
+    with sqlite3.connect(PROFILE_DB_PATH) as conn:
+        rows = conn.execute("SELECT email FROM sent_emails").fetchall()
+    return {str(row[0]).strip().lower() for row in rows if row and row[0]}
+
+
+def _save_sent_emails_db(emails: Iterable[str]) -> None:
+    _init_sent_emails_db()
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    normalized = []
+    for email in emails:
+        lowered = email.strip().lower()
+        if lowered:
+            normalized.append((lowered, ts))
+    if not normalized:
+        return
+    with sqlite3.connect(PROFILE_DB_PATH) as conn:
+        conn.executemany("INSERT OR IGNORE INTO sent_emails(email, created_at) VALUES (?, ?)", normalized)
+        conn.commit()
+
+
+def _filter_unsent_emails(emails: Iterable[str]) -> list[str]:
+    sent = _load_sent_emails_file().union(_load_sent_emails_db())
+    result: list[str] = []
+    for email in emails:
+        lowered = email.strip().lower()
+        if lowered and lowered not in sent:
+            result.append(email)
+    return result
+
+
 def load_templates() -> tuple[str, str]:
     edit_dir = _resolve_or_create_dir(EDIT_DIR_CANDIDATES)
     subject = (edit_dir / SUBJECT_FILENAME).read_text(encoding="utf-8").strip()
@@ -320,7 +406,7 @@ def _write_log(message: str) -> None:
 
 
 @contextmanager
-def open_ads_page(ads_profile_id: str) -> Iterable[tuple[Page, BrowserContext]]:
+def open_ads_page(ads_profile_id: str, *, stop_profile_on_exit: bool = True) -> Iterable[tuple[Page, BrowserContext]]:
     if sync_playwright is None:
         raise CalendlyAutomationError("playwright is not installed. Run: pip install -r requirements.txt")
 
@@ -347,8 +433,11 @@ def open_ads_page(ads_profile_id: str) -> Iterable[tuple[Page, BrowserContext]]:
             _wait_for_ads_profile_ready(context, page)
             yield page, context
     finally:
-        ads_client.stop_browser(session.profile_id)
-        _progress(f"ADS profile {ads_profile_id} stopped")
+        if stop_profile_on_exit:
+            ads_client.stop_browser(session.profile_id)
+            _progress(f"ADS profile {ads_profile_id} stopped")
+        else:
+            _progress(f"ADS profile {ads_profile_id} left open by configuration.")
 
 
 def _click_first(page: Page, selectors: list[str], timeout: int = 1_500) -> bool:
@@ -1168,7 +1257,10 @@ def register_calendly_account(account_name: str, ads_profile_id: str) -> Registr
         _progress(f"Got email {order.email} (id={order.activation_id})")
 
         try:
-            with open_ads_page(ads_profile_id) as (page, context):
+            with open_ads_page(ads_profile_id, stop_profile_on_exit=not KEEP_PROFILE_OPEN_AFTER_REGISTRATION) as (
+                page,
+                context,
+            ):
                 _progress(f"Waiting {SIGNUP_INITIAL_DELAY_SECONDS}s before opening signup page.")
                 time.sleep(max(0, int(SIGNUP_INITIAL_DELAY_SECONDS)))
                 _open_signup_page_with_recovery(page)
@@ -1804,6 +1896,7 @@ def _fill_booking_form(page: Page, invitee_name: str, invitee_email: str, guest_
     _progress("Waiting booking confirmation.")
     try:
         page.wait_for_selector("text=/scheduled|confirmed|you are scheduled/i", timeout=25_000)
+        time.sleep(max(0, SCHEDULE_CONFIRM_EXTRA_WAIT_SECONDS))
     except Exception as exc:  # noqa: BLE001
         raise CalendlyAutomationError("Booking confirmation was not detected.") from exc
 
@@ -1812,11 +1905,18 @@ def run_booking_sender(
     profile: Profile,
     *,
     booking_url: str,
+    persist_sent: bool = True,
+    single_target_email: str | None = None,
 ) -> SendStats:
     ensure_input_files()
-    email_pool = load_email_pool()
+    if single_target_email:
+        email_pool = [single_target_email.strip()]
+    else:
+        email_pool = load_email_pool()
+        if persist_sent:
+            email_pool = _filter_unsent_emails(email_pool)
     if not email_pool:
-        raise CalendlyAutomationError("Email list is empty.")
+        raise CalendlyAutomationError("Email list is empty (or all emails already sent).")
     total_input = len(email_pool)
 
     target_booking_url = booking_url.strip() or (profile.booking_url or "").strip()
@@ -1850,7 +1950,7 @@ def run_booking_sender(
                 break
 
             invitee_email = email_pool[0]
-            guests_limit = min(BOOKING_GUESTS_PER_EVENT, max(len(email_pool) - 1, 0))
+            guests_limit = 0 if single_target_email else min(BOOKING_GUESTS_PER_EVENT, max(len(email_pool) - 1, 0))
             guest_emails = email_pool[1 : 1 + guests_limit]
             invitee_name = f"{BOOKING_NAME_PREFIX}{random.randint(100, 9999)}"
 
@@ -1864,10 +1964,17 @@ def run_booking_sender(
             used = 1 + len(guest_emails)
             consumed += used
             scheduled += 1
+
+            sent_batch = [invitee_email] + guest_emails
+            if persist_sent:
+                _append_sent_emails_file(sent_batch)
+                _save_sent_emails_db(sent_batch)
+
             email_pool = email_pool[used:]
-            save_email_pool(email_pool)
+            if not single_target_email:
+                save_email_pool(email_pool)
             _progress(f"Booking scheduled: invitee={invitee_email}; guests={len(guest_emails)}")
-            _pause(page, 700)
+            time.sleep(max(0, SEND_BETWEEN_BOOKINGS_SECONDS))
 
         cookie_file = _save_cookies(context, profile.name)
         _write_log(f"Updated cookie file after booking: {cookie_file}")
@@ -1877,4 +1984,17 @@ def run_booking_sender(
         scheduled_events=scheduled,
         consumed_emails=consumed,
         remaining_emails=len(email_pool),
+    )
+
+
+def run_inbox_check_sender(profile: Profile, *, booking_url: str, target_email: str) -> SendStats:
+    """
+    Send one test booking to a specific email.
+    Does not persist email to sent-emails storage.
+    """
+    return run_booking_sender(
+        profile,
+        booking_url=booking_url,
+        persist_sent=False,
+        single_target_email=target_email,
     )
