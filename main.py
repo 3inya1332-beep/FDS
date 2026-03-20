@@ -94,6 +94,13 @@ def _read_last_log_lines(limit: int = 8) -> list[str]:
     return lines[-limit:]
 
 
+def _format_exc(exc: BaseException) -> str:
+    message = str(exc).strip()
+    if message:
+        return message
+    return f"{exc.__class__.__name__}: {exc!r}"
+
+
 def show_api_settings(settings_store: RuntimeSettingsStore) -> None:
     settings = settings_store.load()
     lines = [
@@ -234,7 +241,7 @@ def run_flow(store: ProfileStore, settings_store: RuntimeSettingsStore) -> None:
             lines.append(f"⚠️ Последняя ошибка: {stats.last_error}")
         _print_box(lines, title="ОТЧЕТ ЗАПУСКА")
     except (AdsApiError, InflowAutomationError) as exc:
-        lines = [f"Ошибка запуска: {exc}"]
+        lines = [f"Ошибка запуска: {_format_exc(exc)}"]
         recent = _read_last_log_lines()
         if recent:
             lines.append("")
@@ -282,7 +289,7 @@ def register_flow(store: ProfileStore, settings_store: RuntimeSettingsStore) -> 
             lines.append(f"Профиль [{updated.local_id}] обновлен в базе.")
         _print_box(lines, title="РЕГИСТРАЦИЯ ГОТОВА")
     except (AdsApiError, InflowAutomationError) as exc:
-        lines = [f"Ошибка регистрации: {exc}"]
+        lines = [f"Ошибка регистрации: {_format_exc(exc)}"]
         recent = _read_last_log_lines()
         if recent:
             lines.append("")
@@ -322,7 +329,7 @@ def inbox_check_flow(store: ProfileStore) -> None:
             title="ПРОВЕРКА ИНБОКСА",
         )
     except (AdsApiError, InflowAutomationError) as exc:
-        _print_box([f"Ошибка проверки инбокса: {exc}"], title="ОШИБКА")
+        _print_box([f"Ошибка проверки инбокса: {_format_exc(exc)}"], title="ОШИБКА")
 
 
 def show_menu() -> None:

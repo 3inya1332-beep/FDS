@@ -202,7 +202,7 @@ class AdsApiClient:
         errors: list[str] = []
         for method, path, kwargs in payload_variants:
             try:
-                response_payload = self._request(method, path, **kwargs)
+                response_payload = self._request(method, path, retry_on_rate_limit=0, **kwargs)
                 if not self._is_success(response_payload):
                     errors.append(str(response_payload))
                     time.sleep(0.6)

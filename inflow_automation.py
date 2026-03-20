@@ -77,6 +77,13 @@ class RotationResult:
     new_start_url: str
 
 
+def _exc_text(exc: BaseException) -> str:
+    message = str(exc).strip()
+    if message:
+        return message
+    return f"{exc.__class__.__name__}: {exc!r}"
+
+
 def _resolve_or_create_dir(candidates: list[Path]) -> Path:
     for folder in candidates:
         if folder.exists():
@@ -1008,16 +1015,20 @@ def _rotate_profile_on_limit(
     _write_log(f"New ADS profile created: {new_profile_id}")
 
     anymessage_client = _build_anymessage_client(runtime_settings)
+    _write_log(f"Starting ADS browser for new profile: {new_profile_id}")
     new_session = ads_client.start_browser(
         profile_id=new_profile_id,
         headless=ADS_HEADLESS,
         open_tabs=ADS_OPEN_TABS,
     )
+    _write_log(f"ADS browser started for new profile: {new_profile_id}; cdp={new_session.cdp_url}")
     try:
+        _write_log("Connecting Playwright to new ADS browser session.")
         new_browser = playwright.chromium.connect_over_cdp(new_session.cdp_url)
         new_context = new_browser.contexts[0] if new_browser.contexts else new_browser.new_context()
         new_page = new_context.pages[0] if new_context.pages else new_context.new_page()
         new_ui = InflowUi(new_page)
+        _write_log("Running new Inflow account registration flow.")
         new_start_url = new_ui.register_new_inflow_account(
             registration_name=registration_name,
             anymessage_client=anymessage_client,
@@ -1198,14 +1209,14 @@ def run_job(
     except AdsApiError:
         raise
     except ProxyApiError as exc:
-        last_error = str(exc)
-        raise InflowAutomationError(str(exc)) from exc
+        last_error = _exc_text(exc)
+        raise InflowAutomationError(_exc_text(exc)) from exc
     except AnyMessageApiError as exc:
-        last_error = str(exc)
-        raise InflowAutomationError(str(exc)) from exc
+        last_error = _exc_text(exc)
+        raise InflowAutomationError(_exc_text(exc)) from exc
     except Exception as exc:  # noqa: BLE001
-        last_error = str(exc)
-        raise InflowAutomationError(str(exc)) from exc
+        last_error = _exc_text(exc)
+        raise InflowAutomationError(_exc_text(exc)) from exc
     finally:
         _write_log(
             f"Job finished: total_emails={len(emails_all)}, total_orders={len(triplets)}, "
@@ -1250,7 +1261,7 @@ def register_new_account_for_profile(
                 delete_old_profile=True,
             )
     except (ProxyApiError, AnyMessageApiError) as exc:
-        raise InflowAutomationError(str(exc)) from exc
+        raise InflowAutomationError(_exc_text(exc)) from exc
 
 
 def run_inbox_check(profile: Profile, target_email: str) -> RunStats:
@@ -1290,8 +1301,8 @@ def run_inbox_check(profile: Profile, target_email: str) -> RunStats:
                 message=message,
             )
     except Exception as exc:  # noqa: BLE001
-        last_error = str(exc)
-        raise InflowAutomationError(str(exc)) from exc
+        last_error = _exc_text(exc)
+        raise InflowAutomationError(_exc_text(exc)) from exc
     finally:
         if ads_session is not None:
             ads_client.stop_browser(ads_session.profile_id)
@@ -1312,4 +1323,4 @@ def _write_log(message: str) -> None:
     log_file = LOGS_DIR / "automation.log"
     with log_file.open("a", encoding="utf-8") as file:
         file.write(f"[{timestamp}] {message}\n")
-    print(f"[{timestamp}] {message}")
+    print(f"[{timestamp}] {message}", flush=True)
