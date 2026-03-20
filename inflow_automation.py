@@ -382,10 +382,64 @@ class InflowUi:
             self.page.wait_for_timeout(400)
         raise InflowAutomationError("Страница Inflow не готова: кнопка Email не появилась вовремя.")
 
+    def _recover_navigation_page(self) -> None:
+        try:
+            if self.page.is_closed():
+                self.page = self.page.context.new_page()
+                return
+        except Exception:  # noqa: BLE001
+            pass
+
+        try:
+            self.page.goto("about:blank", wait_until="commit", timeout=5_000)
+            return
+        except Exception:  # noqa: BLE001
+            pass
+
+        try:
+            new_page = self.page.context.new_page()
+            try:
+                self.page.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self.page = new_page
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _goto_with_retries(
+        self,
+        url: str,
+        *,
+        description: str,
+        attempts: int = 4,
+        wait_until: str = "domcontentloaded",
+        timeout_ms: int = 45_000,
+    ) -> None:
+        last_error: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                self.maximize_window()
+                self.page.goto(url, wait_until=wait_until, timeout=timeout_ms)
+                self.maximize_window()
+                return
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                _write_log(
+                    f"Navigation failed: {description}; attempt={attempt}/{attempts}; "
+                    f"url={url}; error={exc}"
+                )
+                self._recover_navigation_page()
+                self.page.wait_for_timeout(700 + attempt * 150)
+        raise InflowAutomationError(
+            f"Не удалось открыть {description} после {attempts} попыток. Последняя ошибка: {last_error}"
+        )
+
     def open_page(self, url: str) -> None:
-        self.maximize_window()
-        self.page.goto(url, wait_until="domcontentloaded", timeout=90_000)
-        self.page.wait_for_load_state("networkidle", timeout=60_000)
+        self._goto_with_retries(url, description="рабочую страницу", attempts=4, wait_until="domcontentloaded")
+        try:
+            self.page.wait_for_load_state("networkidle", timeout=12_000)
+        except Exception:  # noqa: BLE001
+            pass
         self.maximize_window()
         self.wait_until_ready(timeout_ms=90_000)
 
@@ -769,8 +823,16 @@ class InflowUi:
         raise InflowAutomationError(f"Ожидание URL с '{expected_substring}' превысило timeout.")
 
     def _create_purchase_order(self, *, vendor_required: bool) -> str:
-        self.page.goto(DEFAULT_INFLOW_URL, wait_until="domcontentloaded", timeout=90_000)
-        self.page.wait_for_load_state("networkidle", timeout=60_000)
+        self._goto_with_retries(
+            DEFAULT_INFLOW_URL,
+            description="страницу Purchase Orders",
+            attempts=4,
+            wait_until="domcontentloaded",
+        )
+        try:
+            self.page.wait_for_load_state("networkidle", timeout=10_000)
+        except Exception:  # noqa: BLE001
+            pass
 
         self._click_by_text_patterns([r"new\s*purchase\s*order"], timeout_ms=18_000)
 
@@ -808,8 +870,13 @@ class InflowUi:
         _write_log(f"Bought gmail via AnyMessage: {mailbox.email}")
 
         _write_log("Шаг 2/8: Открываю страницу регистрации Inflow.")
-        self.maximize_window()
-        self.page.goto(INFLOW_SIGNUP_URL, wait_until="domcontentloaded", timeout=90_000)
+        self._goto_with_retries(
+            INFLOW_SIGNUP_URL,
+            description="страницу регистрации Inflow",
+            attempts=5,
+            wait_until="commit",
+            timeout_ms=35_000,
+        )
         # Avoid long hangs on networkidle (tracking/telemetry can keep connections open).
         try:
             self.page.wait_for_load_state("load", timeout=12_000)
@@ -839,11 +906,27 @@ class InflowUi:
         _write_log("Шаг 7/8: Жду письмо подтверждения и подтверждаю почту.")
         confirm_url = anymessage_client.wait_inflow_confirmation_link(mailbox)
         _write_log(f"Inflow confirmation URL found: {confirm_url}")
-        self.page.goto(confirm_url, wait_until="domcontentloaded", timeout=90_000)
-        self.page.wait_for_load_state("networkidle", timeout=60_000)
+        self._goto_with_retries(
+            confirm_url,
+            description="ссылку подтверждения почты",
+            attempts=4,
+            wait_until="domcontentloaded",
+        )
+        try:
+            self.page.wait_for_load_state("networkidle", timeout=12_000)
+        except Exception:  # noqa: BLE001
+            pass
 
-        self.page.goto(first_purchase_url, wait_until="domcontentloaded", timeout=90_000)
-        self.page.wait_for_load_state("networkidle", timeout=60_000)
+        self._goto_with_retries(
+            first_purchase_url,
+            description="первый Purchase Order после подтверждения",
+            attempts=4,
+            wait_until="domcontentloaded",
+        )
+        try:
+            self.page.wait_for_load_state("networkidle", timeout=12_000)
+        except Exception:  # noqa: BLE001
+            pass
         try:
             self.open_purchase_order_modal()
             self._resolve_company_switch_dialogs()
