@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
@@ -36,22 +37,39 @@ class AdsApiClient:
             # Different ADS API builds may use one of these headers.
             headers["Authorization"] = self.api_key
             headers["X-API-KEY"] = self.api_key
+            headers["api-key"] = self.api_key
+            headers["api_key"] = self.api_key
         return headers
 
-    def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+    def _request(self, method: str, path: str, *, retry_on_rate_limit: int = 2, **kwargs: Any) -> dict[str, Any]:
+        params = dict(kwargs.pop("params", {}) or {})
+        if self.api_key and self.api_key != "PASTE_YOUR_ADS_API_KEY":
+            # Some ADS API builds accept key only as query param.
+            params.setdefault("api-key", self.api_key)
+            params.setdefault("api_key", self.api_key)
+        kwargs["params"] = params
+
         url = f"{self.base_url}{path}"
-        response = requests.request(
-            method=method.upper(),
-            url=url,
-            timeout=self.timeout_seconds,
-            headers=self._headers(),
-            **kwargs,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        if isinstance(payload, dict):
+        attempts = max(0, retry_on_rate_limit) + 1
+        for attempt in range(attempts):
+            response = requests.request(
+                method=method.upper(),
+                url=url,
+                timeout=self.timeout_seconds,
+                headers=self._headers(),
+                **kwargs,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise AdsApiError(f"Unexpected ADS API response: {payload!r}")
+
+            if self._is_rate_limited(payload) and attempt < attempts - 1:
+                time.sleep(1.2 * (attempt + 1))
+                continue
             return payload
-        raise AdsApiError(f"Unexpected ADS API response: {payload!r}")
+
+        raise AdsApiError("ADS API request failed after retries.")
 
     @staticmethod
     def _extract_cdp_url(data: dict[str, Any]) -> str | None:
@@ -93,6 +111,11 @@ class AdsApiClient:
             return bool(payload["success"])
         return True
 
+    @staticmethod
+    def _is_rate_limited(payload: dict[str, Any]) -> bool:
+        message = str(payload.get("msg", "") or payload.get("message", "")).lower()
+        return "too many request" in message or "rate limit" in message
+
     def start_browser(
         self,
         profile_id: str,
@@ -129,14 +152,17 @@ class AdsApiClient:
                 response_payload = self._request(method, path, **kwargs)
                 if not self._is_success(response_payload):
                     errors.append(str(response_payload))
+                    time.sleep(0.6)
                     continue
                 data = self._data_from_payload(response_payload)
                 cdp_url = self._extract_cdp_url(data)
                 if cdp_url:
                     return AdsBrowserSession(profile_id=profile_id, cdp_url=cdp_url)
                 errors.append(f"CDP endpoint not found in payload: {response_payload}")
+                time.sleep(0.6)
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"{method} {path} failed: {exc}")
+                time.sleep(0.6)
 
         raise AdsApiError("Unable to start ADS browser profile. " + " | ".join(errors))
 

@@ -4,7 +4,7 @@ BASE_DIR = Path(__file__).resolve().parent
 
 # ADS Browser local API
 LOCAL_API_BASE = "http://127.0.0.1:50325"
-API_KEY = "PASTE_YOUR_ADS_API_KEY"
+API_KEY = "0b164afcd0bf4a80370594b331f1aa0b0086cd551c0bdc24"
 ADS_TIMEOUT_SECONDS = 60
 ADS_HEADLESS = False
 ADS_OPEN_TABS = 1
