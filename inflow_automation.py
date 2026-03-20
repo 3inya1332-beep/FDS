@@ -525,6 +525,29 @@ class InflowUi:
 
         raise InflowAutomationError("Не удалось найти поле MESSAGE.")
 
+    def _click_okay_if_present(self, timeout_ms: int = 5_000) -> bool:
+        deadline = time.time() + (timeout_ms / 1000)
+        while time.time() < deadline:
+            candidates = [
+                self.page.get_by_role("button", name=re.compile(r"^(okay|ok)$", re.I)),
+                self.page.locator("button:has-text('Okay')"),
+                self.page.locator("button:has-text('OK')"),
+            ]
+            for locator in candidates:
+                try:
+                    if locator.count() == 0:
+                        continue
+                    button = locator.first
+                    if not button.is_visible():
+                        continue
+                    button.click()
+                    self.page.wait_for_timeout(250)
+                    return True
+                except Exception:  # noqa: BLE001
+                    continue
+            self.page.wait_for_timeout(200)
+        return False
+
     def send_purchase_order(
         self,
         to_email: str,
@@ -553,10 +576,23 @@ class InflowUi:
             "кнопка Send",
         )
 
+        # After sending, Inflow may show a success popup with "Okay" button.
+        # The script must acknowledge it, otherwise next iteration stalls.
+        if self._click_okay_if_present(timeout_ms=8_000):
+            _write_log("Success popup confirmed with Okay.")
+
         try:
-            dialog.wait_for(state="hidden", timeout=20_000)
-        except PlaywrightTimeoutError as exc:
-            raise InflowAutomationError("Окно отправки не закрылось после нажатия Send.") from exc
+            dialog.wait_for(state="hidden", timeout=12_000)
+        except PlaywrightTimeoutError:
+            # Some states keep overlays visible; try one more Okay click.
+            if self._click_okay_if_present(timeout_ms=3_000):
+                _write_log("Second success popup confirmation performed.")
+            try:
+                dialog.wait_for(state="hidden", timeout=6_000)
+            except PlaywrightTimeoutError as exc:
+                raise InflowAutomationError(
+                    "Окно отправки не закрылось после Send/Okay."
+                ) from exc
 
 
 def run_job(profile: Profile) -> RunStats:
