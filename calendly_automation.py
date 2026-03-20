@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+import requests
+
 try:
     from playwright.sync_api import (
         Browser,
@@ -42,7 +44,8 @@ from config import (
     ANYMESSAGE_POLL_SECONDS,
     BODY_FILENAME,
     BOOKING_GUESTS_PER_EVENT,
-    BOOKING_NAME_PREFIX,
+    BOOKING_TYPING_DELAY_MAX_MS,
+    BOOKING_TYPING_DELAY_MIN_MS,
     CALENDLY_MEETING_TYPES_URL,
     CALENDLY_SIGNUP_URL,
     CAPTCHA_MANUAL_TIMEOUT_SECONDS,
@@ -65,6 +68,8 @@ from config import (
     SENDER_CAPTCHA_PROXY_HOST,
     SENDER_CAPTCHA_PROXY_PASSWORD,
     SENDER_CAPTCHA_PROXY_PORT,
+    SENDER_CAPTCHA_PROXY_ROTATE_TIMEOUT_SECONDS,
+    SENDER_CAPTCHA_PROXY_ROTATE_URL,
     SENDER_CAPTCHA_PROXY_TYPE,
     SENDER_CAPTCHA_PROXY_USER,
     SENT_EMAILS_DIR,
@@ -287,6 +292,150 @@ def _generate_password(min_len: int = 14) -> str:
     password.extend(secrets.choice(alphabet) for _ in range(max(min_len - 4, 8)))
     random.shuffle(password)
     return "".join(password)
+
+
+_REAL_FIRST_NAMES = [
+    "Liam",
+    "Noah",
+    "Oliver",
+    "Elijah",
+    "James",
+    "William",
+    "Benjamin",
+    "Lucas",
+    "Henry",
+    "Theodore",
+    "Jack",
+    "Levi",
+    "Alexander",
+    "Jackson",
+    "Mateo",
+    "Daniel",
+    "Michael",
+    "Mason",
+    "Sebastian",
+    "Ethan",
+    "Aiden",
+    "Logan",
+    "Jacob",
+    "Samuel",
+    "David",
+    "Joseph",
+    "John",
+    "Owen",
+    "Wyatt",
+    "Matthew",
+    "Luke",
+    "Asher",
+    "Carter",
+    "Julian",
+    "Grayson",
+    "Leo",
+    "Jayden",
+    "Gabriel",
+    "Isaac",
+    "Lincoln",
+    "Anthony",
+    "Hudson",
+    "Dylan",
+    "Ezra",
+    "Thomas",
+    "Charles",
+    "Christopher",
+    "Jaxon",
+    "Maverick",
+    "Josiah",
+]
+
+_REAL_LAST_NAMES = [
+    "Smith",
+    "Johnson",
+    "Williams",
+    "Brown",
+    "Jones",
+    "Garcia",
+    "Miller",
+    "Davis",
+    "Rodriguez",
+    "Martinez",
+    "Hernandez",
+    "Lopez",
+    "Gonzalez",
+    "Wilson",
+    "Anderson",
+    "Thomas",
+    "Taylor",
+    "Moore",
+    "Jackson",
+    "Martin",
+    "Lee",
+    "Perez",
+    "Thompson",
+    "White",
+    "Harris",
+    "Sanchez",
+    "Clark",
+    "Ramirez",
+    "Lewis",
+    "Robinson",
+    "Walker",
+    "Young",
+    "Allen",
+    "King",
+    "Wright",
+    "Scott",
+    "Torres",
+    "Nguyen",
+    "Hill",
+    "Flores",
+    "Green",
+    "Adams",
+    "Nelson",
+    "Baker",
+    "Hall",
+    "Rivera",
+    "Campbell",
+    "Mitchell",
+    "Carter",
+    "Roberts",
+]
+
+
+def _generate_real_invitee_name(used_names: set[str] | None = None) -> str:
+    for _ in range(30):
+        candidate = f"{random.choice(_REAL_FIRST_NAMES)} {random.choice(_REAL_LAST_NAMES)}"
+        if used_names is None or candidate not in used_names:
+            if used_names is not None:
+                used_names.add(candidate)
+            return candidate
+    # Rare fallback when many names already used in one run.
+    candidate = f"{random.choice(_REAL_FIRST_NAMES)} {random.choice(_REAL_LAST_NAMES)} {random.randint(10, 99)}"
+    if used_names is not None:
+        used_names.add(candidate)
+    return candidate
+
+
+def _type_like_human(page: Page, target: Locator, value: str) -> bool:
+    try:
+        target.click(timeout=1_500)
+        target.press("Control+A")
+        target.press("Delete")
+        target.type(
+            value,
+            delay=random.randint(
+                max(1, BOOKING_TYPING_DELAY_MIN_MS),
+                max(BOOKING_TYPING_DELAY_MIN_MS, BOOKING_TYPING_DELAY_MAX_MS),
+            ),
+        )
+        # Small settle delay after typing.
+        page.wait_for_timeout(random.randint(80, 180))
+        return True
+    except Exception:  # noqa: BLE001
+        try:
+            target.fill(value)
+            return True
+        except Exception:  # noqa: BLE001
+            return False
 
 
 def _read_non_empty_lines(path: Path) -> list[str]:
@@ -653,6 +802,28 @@ def _parse_screen_resolution(value: str) -> tuple[int, int]:
     width = max(1280, int(match.group(1)))
     height = max(720, int(match.group(2)))
     return width, height
+
+
+def _rotate_sender_proxy_for_recovery() -> None:
+    url = (SENDER_CAPTCHA_PROXY_ROTATE_URL or "").strip()
+    if not url:
+        return
+    rotate_url = url
+    if "port=" not in rotate_url.lower():
+        separator = "&" if "?" in rotate_url else "?"
+        rotate_url = f"{rotate_url}{separator}port={SENDER_CAPTCHA_PROXY_PORT}"
+    _progress(
+        f"Sender captcha recovery: rotating proxy via API (same profile port {SENDER_CAPTCHA_PROXY_PORT})."
+    )
+    try:
+        response = requests.get(rotate_url, timeout=max(1, int(SENDER_CAPTCHA_PROXY_ROTATE_TIMEOUT_SECONDS)))
+        payload = (response.text or "").strip()
+        if response.ok:
+            _progress(f"Proxy rotate API response: {payload[:200]}")
+            return
+        _progress(f"Proxy rotate API HTTP {response.status_code}: {payload[:200]}")
+    except Exception as exc:  # noqa: BLE001
+        _progress(f"Proxy rotate API warning: {exc}")
 
 
 def _raise_sender_captcha(page: Page, stage: str) -> None:
@@ -1497,6 +1668,8 @@ def recreate_ads_profile_after_sender_captcha(*, old_profile_id: str, profile_na
     except Exception as exc:  # noqa: BLE001
         _progress(f"Old ADS profile delete warning: {exc}")
 
+    _rotate_sender_proxy_for_recovery()
+
     new_profile_name = (
         f"{SENDER_CAPTCHA_PROFILE_NAME_PREFIX}-{_slugify(profile_name)}-{int(time.time())}"
     )
@@ -1910,18 +2083,23 @@ def _fill_booking_form(page: Page, invitee_name: str, invitee_email: str, guest_
     _progress("Filling Enter Details form.")
     _raise_sender_captcha(page, "booking form opened")
 
-    # Try strict selectors first.
-    name_filled = _fill_first(
-        page,
-        [
-            "input[name='name']",
-            "input[aria-label*='Name' i]",
-            "input[placeholder*='Name' i]",
-            "xpath=//*[contains(translate(.,'NAME','name'),'name')]/following::input[1]",
-        ],
-        invitee_name,
-        timeout=1_800,
-    )
+    # Try strict selectors first, with human-like typing.
+    name_filled = False
+    for selector in [
+        "input[name='name']",
+        "input[aria-label*='Name' i]",
+        "input[placeholder*='Name' i]",
+        "xpath=//*[contains(translate(.,'NAME','name'),'name')]/following::input[1]",
+    ]:
+        candidate = page.locator(selector).first
+        try:
+            if candidate.count() == 0 or not candidate.is_visible():
+                continue
+            if _type_like_human(page, candidate, invitee_name):
+                name_filled = True
+                break
+        except Exception:  # noqa: BLE001
+            continue
     if not name_filled:
         # Fallback: first visible text input on form.
         inputs = page.locator("input:not([type='hidden'])")
@@ -1930,9 +2108,9 @@ def _fill_booking_form(page: Page, invitee_name: str, invitee_email: str, guest_
             candidate = inputs.nth(idx)
             try:
                 if candidate.is_visible():
-                    candidate.fill(invitee_name)
-                    name_filled = True
-                    break
+                    if _type_like_human(page, candidate, invitee_name):
+                        name_filled = True
+                        break
             except Exception:  # noqa: BLE001
                 continue
     if not name_filled:
@@ -1965,18 +2143,23 @@ def _fill_booking_form(page: Page, invitee_name: str, invitee_email: str, guest_
     if not name_filled:
         raise CalendlyAutomationError("Invitee Name input not found.")
 
-    email_filled = _fill_first(
-        page,
-        [
-            "input[name='email']",
-            "input[type='email']",
-            "input[aria-label*='Email' i]",
-            "input[placeholder*='Email' i]",
-            "xpath=//*[contains(translate(.,'EMAIL','email'),'email')]/following::input[1]",
-        ],
-        invitee_email,
-        timeout=1_800,
-    )
+    email_filled = False
+    for selector in [
+        "input[name='email']",
+        "input[type='email']",
+        "input[aria-label*='Email' i]",
+        "input[placeholder*='Email' i]",
+        "xpath=//*[contains(translate(.,'EMAIL','email'),'email')]/following::input[1]",
+    ]:
+        candidate = page.locator(selector).first
+        try:
+            if candidate.count() == 0 or not candidate.is_visible():
+                continue
+            if _type_like_human(page, candidate, invitee_email):
+                email_filled = True
+                break
+        except Exception:  # noqa: BLE001
+            continue
     if not email_filled:
         # Fallback: second visible text-like input on form.
         inputs = page.locator("input:not([type='hidden'])")
@@ -1990,8 +2173,7 @@ def _fill_booking_form(page: Page, invitee_name: str, invitee_email: str, guest_
                 continue
         if len(visible_indices) >= 2:
             try:
-                inputs.nth(visible_indices[1]).fill(invitee_email)
-                email_filled = True
+                email_filled = _type_like_human(page, inputs.nth(visible_indices[1]), invitee_email)
             except Exception:  # noqa: BLE001
                 pass
     if not email_filled:
@@ -2055,7 +2237,8 @@ def _fill_booking_form(page: Page, invitee_name: str, invitee_email: str, guest_
             for guest in guest_emails:
                 try:
                     guest_input.click(timeout=1_500)
-                    guest_input.fill(guest)
+                    if not _type_like_human(page, guest_input, guest):
+                        guest_input.fill(guest)
                     guest_input.press("Enter")
                     _pause(page, 40)
                 except Exception:  # noqa: BLE001
@@ -2110,6 +2293,7 @@ def run_booking_sender(
 
     scheduled = 0
     consumed = 0
+    used_invitee_names: set[str] = set()
 
     with open_ads_page(profile.ads_profile_id) as (page, context):
         _load_cookies_if_present(context, profile.cookie_file)
@@ -2141,7 +2325,7 @@ def run_booking_sender(
             invitee_email = email_pool[0]
             guests_limit = 0 if single_target_email else min(BOOKING_GUESTS_PER_EVENT, max(len(email_pool) - 1, 0))
             guest_emails = email_pool[1 : 1 + guests_limit]
-            invitee_name = f"{BOOKING_NAME_PREFIX}{random.randint(100, 9999)}"
+            invitee_name = _generate_real_invitee_name(used_invitee_names)
 
             _fill_booking_form(
                 page,
