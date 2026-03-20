@@ -277,13 +277,33 @@ class InflowUi:
     def _type_into_field(self, field: Locator, value: str, *, confirm_with_enter: bool) -> None:
         field.scroll_into_view_if_needed()
         field.click()
+        success = False
         try:
-            field.fill("")
             field.fill(value)
+            success = True
         except Exception:  # noqa: BLE001
+            pass
+
+        if not success:
+            try:
+                field.evaluate(
+                    "(el, v) => {"
+                    "  el.focus();"
+                    "  if ('value' in el) { el.value = v; } else { el.textContent = v; }"
+                    "  el.dispatchEvent(new Event('input', { bubbles: true }));"
+                    "  el.dispatchEvent(new Event('change', { bubbles: true }));"
+                    "}",
+                    value,
+                )
+                success = True
+            except Exception:  # noqa: BLE001
+                pass
+
+        if not success:
             self.page.keyboard.press("Control+A")
             self.page.keyboard.press("Backspace")
-            self.page.keyboard.type(value, delay=20)
+            self.page.keyboard.type(value, delay=25)
+
         if confirm_with_enter:
             self.page.keyboard.press("Enter")
             self.page.wait_for_timeout(200)
@@ -300,7 +320,31 @@ class InflowUi:
                 continue
         return None
 
-    def _fill_recipient_input(self, dialog: Locator, email: str, placeholder_pattern: str, label: str) -> None:
+    def _dialog_editable_inputs(self, dialog: Locator) -> list[Locator]:
+        editable: list[Locator] = []
+        inputs = dialog.locator("input:not([type='hidden'])")
+        for idx in range(inputs.count()):
+            try:
+                field = inputs.nth(idx)
+                if not field.is_visible():
+                    continue
+                if field.get_attribute("disabled") is not None:
+                    continue
+                if field.get_attribute("readonly") is not None:
+                    continue
+                editable.append(field)
+            except Exception:  # noqa: BLE001
+                continue
+        return editable
+
+    def _fill_recipient_input(
+        self,
+        dialog: Locator,
+        email: str,
+        placeholder_pattern: str,
+        label: str,
+        fallback_index: int,
+    ) -> None:
         candidates = [
             dialog.get_by_placeholder(re.compile(placeholder_pattern, re.I)),
             self.page.get_by_placeholder(re.compile(placeholder_pattern, re.I)),
@@ -317,10 +361,14 @@ class InflowUi:
         ]
         field = self._first_visible_field(candidates)
         if field is None:
+            editable_inputs = self._dialog_editable_inputs(dialog)
+            if len(editable_inputs) > fallback_index:
+                field = editable_inputs[fallback_index]
+        if field is None:
             raise InflowAutomationError(f"Не удалось найти поле {label}.")
         self._type_into_field(field, email, confirm_with_enter=True)
 
-    def _fill_subject_input(self, dialog: Locator, subject: str) -> None:
+    def _fill_subject_input(self, dialog: Locator, subject: str, fallback_index: int) -> None:
         candidates = [
             dialog.locator(
                 "xpath=.//*[contains(translate(normalize-space(text()), "
@@ -336,6 +384,10 @@ class InflowUi:
             self.page.get_by_placeholder(re.compile(r"subject", re.I)),
         ]
         field = self._first_visible_field(candidates)
+        if field is None:
+            editable_inputs = self._dialog_editable_inputs(dialog)
+            if len(editable_inputs) > fallback_index:
+                field = editable_inputs[fallback_index]
         if field is None:
             raise InflowAutomationError("Не удалось найти поле Subject.")
         self._type_into_field(field, subject, confirm_with_enter=False)
@@ -391,10 +443,10 @@ class InflowUi:
         dialog = self.open_purchase_order_modal()
         _write_log("Send modal opened, start filling fields.")
 
-        self._fill_recipient_input(dialog, to_email, r"enter\s*to\s*email", "to")
-        self._fill_recipient_input(dialog, cc_email, r"enter\s*cc\s*email", "cc")
-        self._fill_recipient_input(dialog, bcc_email, r"enter\s*bcc\s*email", "bcc")
-        self._fill_subject_input(dialog, subject)
+        self._fill_recipient_input(dialog, to_email, r"enter\s*to\s*email", "to", fallback_index=0)
+        self._fill_recipient_input(dialog, cc_email, r"enter\s*cc\s*email", "cc", fallback_index=1)
+        self._fill_recipient_input(dialog, bcc_email, r"enter\s*bcc\s*email", "bcc", fallback_index=2)
+        self._fill_subject_input(dialog, subject, fallback_index=3)
         self._fill_message(dialog, message)
         _write_log("Fields filled, clicking Send.")
 
