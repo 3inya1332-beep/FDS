@@ -138,6 +138,7 @@ def load_job_data() -> tuple[str, str, list[str], list[tuple[str, str, str]]]:
 class InflowUi:
     def __init__(self, page: Page) -> None:
         self.page = page
+        self._f11_used = False
 
     def _email_button_candidates(self) -> list[Locator]:
         return [
@@ -149,6 +150,35 @@ class InflowUi:
         ]
 
     def maximize_window(self) -> None:
+        try:
+            self.page.bring_to_front()
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Primary path: ask Chromium to maximize the native browser window.
+        try:
+            cdp = self.page.context.new_cdp_session(self.page)
+            window_info = cdp.send("Browser.getWindowForTarget")
+            window_id = window_info.get("windowId")
+            if isinstance(window_id, int):
+                cdp.send(
+                    "Browser.setWindowBounds",
+                    {"windowId": window_id, "bounds": {"windowState": "maximized"}},
+                )
+                self.page.wait_for_timeout(250)
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Fallback: emulate F11 fullscreen (some ADS builds ignore window bounds).
+        if not self._f11_used:
+            try:
+                self.page.keyboard.press("F11")
+                self.page.wait_for_timeout(250)
+                self._f11_used = True
+            except Exception:  # noqa: BLE001
+                pass
+
+        # Final fallback: viewport + JS resize.
         try:
             self.page.set_viewport_size({"width": 1920, "height": 1080})
         except Exception:  # noqa: BLE001
