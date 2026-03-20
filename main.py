@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from datetime import datetime
+from pathlib import Path
+import re
 from typing import Iterable
 
 from ads_api import AdsApiError
@@ -15,6 +18,8 @@ from calendly_automation import (
 )
 from config import CALENDLY_MEETING_TYPES_URL
 from profile_store import Profile, ProfileStore
+
+REGISTERED_ACCOUNTS_DIR = Path(__file__).resolve().parent / "registered-accounts"
 
 
 def clear_console() -> None:
@@ -50,6 +55,33 @@ def ask_int(prompt: str) -> int | None:
         print("⚠️ Нужно ввести число.")
         return None
     return int(raw)
+
+
+def _safe_filename(value: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9_-]+", "_", value.strip())
+    return cleaned.strip("_") or "account"
+
+
+def save_registered_credentials(
+    *,
+    account_name: str,
+    ads_profile_id: str,
+    email: str,
+    password: str,
+) -> Path:
+    REGISTERED_ACCOUNTS_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    filename = f"{_safe_filename(account_name)}_{stamp}.txt"
+    file_path = REGISTERED_ACCOUNTS_DIR / filename
+    payload = (
+        f"account_name={account_name}\n"
+        f"ads_profile_id={ads_profile_id}\n"
+        f"email={email}\n"
+        f"password={password}\n"
+        f"saved_at_utc={datetime.utcnow().isoformat(timespec='seconds')}\n"
+    )
+    file_path.write_text(payload, encoding="utf-8")
+    return file_path
 
 
 def add_profile_flow(store: ProfileStore) -> None:
@@ -89,6 +121,12 @@ def register_account_flow(store: ProfileStore) -> None:
 
     print("\n▶️ Начинаем регистрацию через ADS + AnyMessage API...")
     result = register_calendly_account(account_name=account_name, ads_profile_id=ads_profile_id)
+    credentials_path = save_registered_credentials(
+        account_name=result.account_name,
+        ads_profile_id=ads_profile_id,
+        email=result.login_email,
+        password=result.password,
+    )
     booking_url = input("🔗 Ссылка отправки (booking link, можно оставить пустым): ").strip()
     try:
         store.add_profile(
@@ -121,6 +159,7 @@ def register_account_flow(store: ProfileStore) -> None:
     print(f"   📧 Email: {result.login_email}")
     print(f"   🔐 Password: {result.password}")
     print(f"   🍪 Cookie file: {result.cookie_file}")
+    print(f"   🗂️ Credentials file: {credentials_path}")
     print("🛠️ Профиль оставлен открытым: настройте шаблоны вручную в браузере.")
 
 
@@ -231,6 +270,7 @@ def delete_profile_flow(store: ProfileStore) -> None:
 def show_menu() -> None:
     store = ProfileStore()
     ensure_input_files()
+    REGISTERED_ACCOUNTS_DIR.mkdir(parents=True, exist_ok=True)
 
     while True:
         clear_console()
