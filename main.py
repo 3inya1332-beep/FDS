@@ -92,6 +92,8 @@ def run_flow(store: ProfileStore) -> None:
         print(f"  Успешных отправок: {stats.sent_orders}")
         print(f"  Ошибочных отправок: {stats.failed_orders}")
         print(f"  Пропущено email (остаток < 3): {stats.skipped_emails}")
+        if stats.last_error:
+            print(f"  Последняя ошибка: {stats.last_error}")
     except (AdsApiError, InflowAutomationError) as exc:
         print(f"Ошибка запуска: {exc}")
 

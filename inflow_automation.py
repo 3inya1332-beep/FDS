@@ -41,6 +41,7 @@ class RunStats:
     sent_orders: int
     failed_orders: int
     skipped_emails: int
+    last_error: str | None
 
 
 def _resolve_or_create_dir(candidates: list[Path]) -> Path:
@@ -138,9 +139,47 @@ class InflowUi:
     def __init__(self, page: Page) -> None:
         self.page = page
 
+    def _email_button_candidates(self) -> list[Locator]:
+        return [
+            self.page.get_by_role("button", name=re.compile(r"^Email$", re.I)),
+            self.page.get_by_role("link", name=re.compile(r"^Email$", re.I)),
+            self.page.locator("button:has-text('Email')"),
+            self.page.locator("a:has-text('Email')"),
+            self.page.get_by_text(re.compile(r"^Email$", re.I)),
+        ]
+
+    def maximize_window(self) -> None:
+        try:
+            self.page.set_viewport_size({"width": 1920, "height": 1080})
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.page.evaluate(
+                "() => { try { window.moveTo(0, 0); window.resizeTo(screen.availWidth, screen.availHeight); } catch (e) {} }"
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    def wait_until_ready(self, timeout_ms: int = 60_000) -> None:
+        deadline = time.time() + (timeout_ms / 1000)
+        while time.time() < deadline:
+            for locator in self._email_button_candidates():
+                try:
+                    if locator.count() == 0:
+                        continue
+                    locator.first.wait_for(state="visible", timeout=1_000)
+                    return
+                except Exception:  # noqa: BLE001
+                    continue
+            self.page.wait_for_timeout(400)
+        raise InflowAutomationError("Страница Inflow не готова: кнопка Email не появилась вовремя.")
+
     def open_page(self, url: str) -> None:
+        self.maximize_window()
         self.page.goto(url, wait_until="domcontentloaded", timeout=90_000)
-        self.page.wait_for_timeout(1500)
+        self.page.wait_for_load_state("networkidle", timeout=60_000)
+        self.maximize_window()
+        self.wait_until_ready(timeout_ms=90_000)
 
     def _click_first_available(self, candidates: list[Locator], description: str) -> None:
         for locator in candidates:
@@ -171,27 +210,24 @@ class InflowUi:
         raise InflowAutomationError("Не удалось найти открытое окно отправки письма.")
 
     def open_purchase_order_modal(self) -> Locator:
-        self._click_first_available(
-            [
-                self.page.get_by_role("button", name=re.compile(r"^Email$", re.I)),
-                self.page.get_by_role("link", name=re.compile(r"^Email$", re.I)),
-                self.page.locator("button:has-text('Email')"),
-                self.page.locator("a:has-text('Email')"),
-                self.page.get_by_text(re.compile(r"^Email$", re.I)),
-            ],
-            "кнопка Email",
-        )
-
-        self._click_first_available(
-            [
-                self.page.get_by_role("menuitem", name=re.compile(r"Purchase order", re.I)),
-                self.page.get_by_role("button", name=re.compile(r"Purchase order", re.I)),
-                self.page.get_by_text(re.compile(r"^Purchase order$", re.I)),
-            ],
-            "пункт Purchase order",
-        )
-
-        return self._visible_dialog()
+        last_error: Exception | None = None
+        for _ in range(3):
+            try:
+                self.wait_until_ready(timeout_ms=25_000)
+                self._click_first_available(self._email_button_candidates(), "кнопка Email")
+                self._click_first_available(
+                    [
+                        self.page.get_by_role("menuitem", name=re.compile(r"Purchase order", re.I)),
+                        self.page.get_by_role("button", name=re.compile(r"Purchase order", re.I)),
+                        self.page.get_by_text(re.compile(r"^Purchase order$", re.I)),
+                    ],
+                    "пункт Purchase order",
+                )
+                return self._visible_dialog()
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                self.page.wait_for_timeout(1200)
+        raise InflowAutomationError(f"Не удалось открыть окно Purchase order: {last_error}")
 
     def _fill_input(self, dialog: Locator, *, value: str, label: str, placeholder_pattern: str, fallback_index: int) -> None:
         candidates: list[Locator] = []
@@ -317,6 +353,8 @@ def run_job(profile: Profile) -> RunStats:
     sent_orders = 0
     failed_orders = 0
     skipped_emails = len(emails) - len(triplets) * 3
+    last_error: str | None = None
+    fatal_error = False
 
     try:
         _write_log(
@@ -340,32 +378,48 @@ def run_job(profile: Profile) -> RunStats:
             ui.open_page(profile.start_url or DEFAULT_INFLOW_URL)
 
             for to_email, cc_email, bcc_email in triplets:
-                try:
-                    ui.send_purchase_order(
-                        to_email=to_email,
-                        cc_email=cc_email,
-                        bcc_email=bcc_email,
-                        subject=subject,
-                        message=message,
-                    )
-                    sent_orders += 1
-                    _write_log(f"Order sent: TO={to_email}, CC={cc_email}, BCC={bcc_email}")
-                except Exception as order_exc:  # noqa: BLE001
+                sent_current = False
+                for attempt in range(3):
+                    try:
+                        ui.send_purchase_order(
+                            to_email=to_email,
+                            cc_email=cc_email,
+                            bcc_email=bcc_email,
+                            subject=subject,
+                            message=message,
+                        )
+                        sent_orders += 1
+                        sent_current = True
+                        _write_log(f"Order sent: TO={to_email}, CC={cc_email}, BCC={bcc_email}")
+                        break
+                    except Exception as order_exc:  # noqa: BLE001
+                        last_error = str(order_exc)
+                        _write_log(
+                            "Order attempt failed: "
+                            f"attempt={attempt + 1}/3; TO={to_email}, CC={cc_email}, BCC={bcc_email}; "
+                            f"error={order_exc}"
+                        )
+                        try:
+                            ui.maximize_window()
+                            ui.wait_until_ready(timeout_ms=25_000)
+                        except Exception as heal_exc:  # noqa: BLE001
+                            _write_log(f"Recovery wait failed: {heal_exc}")
+                        self_heal_delay = 1.5 + attempt
+                        time.sleep(self_heal_delay)
+                if not sent_current:
                     failed_orders += 1
-                    _write_log(
-                        "Order failed: "
-                        f"TO={to_email}, CC={cc_email}, BCC={bcc_email}; error={order_exc}"
-                    )
                 time.sleep(SEND_DELAY_SECONDS)
-
-            browser.close()
     except AdsApiError:
         raise
     except Exception as exc:  # noqa: BLE001
+        fatal_error = True
+        last_error = str(exc)
         raise InflowAutomationError(str(exc)) from exc
     finally:
-        if ads_session is not None:
+        if ads_session is not None and not (fatal_error or failed_orders > 0):
             ads_client.stop_browser(ads_session.profile_id)
+        elif ads_session is not None:
+            _write_log("Browser left open because there were automation errors.")
         _write_log(
             f"Job finished: total_emails={len(emails)}, total_orders={len(triplets)}, "
             f"sent_orders={sent_orders}, failed_orders={failed_orders}, skipped={skipped_emails}"
@@ -377,6 +431,7 @@ def run_job(profile: Profile) -> RunStats:
         sent_orders=sent_orders,
         failed_orders=failed_orders,
         skipped_emails=skipped_emails,
+        last_error=last_error,
     )
 
 
