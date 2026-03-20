@@ -144,6 +144,7 @@ class InflowUi:
         return [
             self.page.get_by_role("button", name=re.compile(r"^Email$", re.I)),
             self.page.get_by_role("link", name=re.compile(r"^Email$", re.I)),
+            self.page.locator("[title='Email'], [aria-label='Email']"),
             self.page.locator("button:has-text('Email')"),
             self.page.locator("a:has-text('Email')"),
             self.page.get_by_text(re.compile(r"^Email$", re.I)),
@@ -154,6 +155,26 @@ class InflowUi:
             self.page.get_by_role("menuitem", name=re.compile(r"Purchase order", re.I)),
             self.page.get_by_role("button", name=re.compile(r"Purchase order", re.I)),
             self.page.get_by_text(re.compile(r"^Purchase order$", re.I)),
+        ]
+
+    def _send_modal_candidates(self) -> list[Locator]:
+        return [
+            self.page.locator(
+                "xpath=//div[.//*[contains(translate(normalize-space(text()), "
+                "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'send purchase order')] "
+                "and .//button[contains(translate(normalize-space(text()), "
+                "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'send')]]"
+            ),
+            self.page.locator(
+                "xpath=//*[contains(translate(normalize-space(text()), "
+                "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'send purchase order')]/"
+                "ancestor::*[@role='dialog' or contains(@class,'modal')][1]"
+            ),
+            self.page.locator(
+                "xpath=//input[contains(translate(@placeholder, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), "
+                "'enter to email')]/ancestor::div[.//button[contains(translate(normalize-space(text()), "
+                "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'send')]][1]"
+            ),
         ]
 
     def maximize_window(self) -> None:
@@ -232,16 +253,14 @@ class InflowUi:
         raise InflowAutomationError(f"Не удалось нажать: {description}")
 
     def _visible_dialog(self, timeout_ms: int = 20_000) -> Locator:
-        candidates = [
-            self.page.locator('div[role="dialog"]:visible').last,
-            self.page.locator(".modal:visible").last,
-        ]
+        candidates = [*self._send_modal_candidates(), self.page.locator('div[role="dialog"]:visible').last]
         for dialog in candidates:
             try:
                 if dialog.count() == 0:
                     continue
-                dialog.wait_for(state="visible", timeout=timeout_ms)
-                return dialog
+                target = dialog.first
+                target.wait_for(state="visible", timeout=timeout_ms)
+                return target
             except Exception:  # noqa: BLE001
                 continue
         raise InflowAutomationError("Не удалось найти открытое окно отправки письма.")
@@ -258,6 +277,7 @@ class InflowUi:
     def open_purchase_order_modal(self) -> Locator:
         already_open = self._visible_dialog_or_none()
         if already_open is not None:
+            _write_log("Send modal already open, skip Email click.")
             return already_open
 
         last_error: Exception | None = None
@@ -270,6 +290,10 @@ class InflowUi:
                 return self._visible_dialog(timeout_ms=20_000)
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
+                existing = self._visible_dialog_or_none()
+                if existing is not None:
+                    _write_log("Send modal became visible after click failure, continue.")
+                    return existing
                 if attempt == 0:
                     self.page.wait_for_timeout(20_000)
         raise InflowAutomationError(f"Не удалось открыть окно Purchase order: {last_error}")
