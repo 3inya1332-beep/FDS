@@ -202,6 +202,32 @@ class AdsApiClient:
         return None
 
     @staticmethod
+    def _desktop_fingerprint(
+        *,
+        screen_width: int,
+        screen_height: int,
+        os_name: str,
+        user_agent: str,
+    ) -> dict[str, Any]:
+        resolution = f"{screen_width}_{screen_height}"
+        return {
+            "user_agent": user_agent,
+            "ua": user_agent,
+            "ua_type": "desktop",
+            "os": os_name,
+            "platform": "Windows",
+            "is_mobi": 0,
+            "mobile": 0,
+            "is_mobile": 0,
+            "device_type": "desktop",
+            "device_name": "PC",
+            "screen_resolution": resolution,
+            "screen_size": resolution,
+            "screen_width": screen_width,
+            "screen_height": screen_height,
+        }
+
+    @staticmethod
     def _is_success(payload: dict[str, Any]) -> bool:
         if "code" in payload:
             return str(payload.get("code")) in {"0", "200"} or payload.get("code") is None
@@ -287,6 +313,10 @@ class AdsApiClient:
         proxy_port: int,
         proxy_user: str = "",
         proxy_password: str = "",
+        desktop_screen_width: int = 1920,
+        desktop_screen_height: int = 1080,
+        desktop_os: str = "windows",
+        desktop_user_agent: str = "",
     ) -> str:
         profile_name = profile_name.strip()
         proxy_host = proxy_host.strip()
@@ -295,6 +325,17 @@ class AdsApiClient:
             raise AdsApiError("Profile name is required for ADS profile creation.")
         if not proxy_host or not port_value:
             raise AdsApiError("Proxy host/port are required for ADS profile creation.")
+        ua_value = desktop_user_agent.strip() or (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/123.0.0.0 Safari/537.36"
+        )
+        desktop_fingerprint = self._desktop_fingerprint(
+            screen_width=max(1280, int(desktop_screen_width)),
+            screen_height=max(720, int(desktop_screen_height)),
+            os_name=(desktop_os or "windows").strip().lower(),
+            user_agent=ua_value,
+        )
 
         create_variants: list[tuple[str, str, dict[str, Any]]] = [
             (
@@ -309,6 +350,9 @@ class AdsApiClient:
                     "proxy_port": port_value,
                     "proxy_user": proxy_user,
                     "proxy_password": proxy_password,
+                    "is_phone": 0,
+                    "is_mobile": 0,
+                    "fingerprint_config": desktop_fingerprint,
                 },
             ),
             (
@@ -325,7 +369,9 @@ class AdsApiClient:
                         "proxy_user": proxy_user,
                         "proxy_password": proxy_password,
                     },
-                    "fingerprint_config": {},
+                    "is_phone": 0,
+                    "is_mobile": 0,
+                    "fingerprint_config": desktop_fingerprint,
                 },
             ),
             (
@@ -342,7 +388,9 @@ class AdsApiClient:
                         "proxy_user": proxy_user,
                         "proxy_password": proxy_password,
                     },
-                    "fingerprint_config": {},
+                    "is_phone": 0,
+                    "is_mobile": 0,
+                    "fingerprint_config": desktop_fingerprint,
                 },
             ),
             (
@@ -350,6 +398,9 @@ class AdsApiClient:
                 "/api/v1/profile/create",
                 {
                     "name": profile_name,
+                    "device_type": "desktop",
+                    "is_mobile": 0,
+                    "fingerprint_config": desktop_fingerprint,
                     "proxy": {
                         "type": "socks5",
                         "host": proxy_host,

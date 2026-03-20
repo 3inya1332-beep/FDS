@@ -58,6 +58,9 @@ from config import (
     REGISTRATION_MAX_ATTEMPTS,
     SCHEDULE_CONFIRM_EXTRA_WAIT_SECONDS,
     SEND_BETWEEN_BOOKINGS_SECONDS,
+    SENDER_CAPTCHA_DESKTOP_OS,
+    SENDER_CAPTCHA_DESKTOP_SCREEN,
+    SENDER_CAPTCHA_DESKTOP_UA,
     SENDER_CAPTCHA_PROFILE_NAME_PREFIX,
     SENDER_CAPTCHA_PROXY_HOST,
     SENDER_CAPTCHA_PROXY_PASSWORD,
@@ -591,9 +594,89 @@ def _sender_captcha_visible(page: Page) -> bool:
     return False
 
 
+def _try_instant_sender_captcha_click(page: Page) -> bool:
+    """
+    Best-effort instant click on captcha checkbox/challenge entry point.
+    This is intentionally fast and non-blocking.
+    """
+    clicked = False
+
+    # Try direct click in captcha frames.
+    for frame in page.frames:
+        url = (frame.url or "").lower()
+        if "recaptcha" not in url and "hcaptcha" not in url and "captcha" not in url:
+            continue
+        for selector in [
+            "#recaptcha-anchor",
+            ".recaptcha-checkbox-border",
+            "div[role='checkbox']",
+            "input[type='checkbox']",
+            "#checkbox",
+        ]:
+            try:
+                target = frame.locator(selector).first
+                if target.count() == 0:
+                    continue
+                target.click(timeout=120, force=True)
+                clicked = True
+                break
+            except Exception:  # noqa: BLE001
+                continue
+        if clicked:
+            break
+
+    # Fallback: click center of visible captcha iframe.
+    if not clicked:
+        for selector in [
+            "iframe[src*='recaptcha']",
+            "iframe[src*='hcaptcha']",
+            "iframe[title*='captcha' i]",
+        ]:
+            try:
+                frame_box = page.locator(selector).first.bounding_box()
+                if frame_box:
+                    x = frame_box["x"] + frame_box["width"] / 2
+                    y = frame_box["y"] + frame_box["height"] / 2
+                    page.mouse.click(x, y)
+                    clicked = True
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+    return clicked
+
+
+def _parse_screen_resolution(value: str) -> tuple[int, int]:
+    raw = (value or "").strip().lower().replace("*", "x")
+    match = re.match(r"^\s*(\d{3,5})\s*x\s*(\d{3,5})\s*$", raw)
+    if not match:
+        return 1920, 1080
+    width = max(1280, int(match.group(1)))
+    height = max(720, int(match.group(2)))
+    return width, height
+
+
 def _raise_sender_captcha(page: Page, stage: str) -> None:
-    if _sender_captcha_visible(page):
-        raise SenderCaptchaDetected(f"Captcha detected during sender ({stage}).")
+    if not _sender_captcha_visible(page):
+        return
+
+    clicked_any = False
+    for _ in range(3):
+        clicked = _try_instant_sender_captcha_click(page)
+        clicked_any = clicked_any or clicked
+        if clicked:
+            _progress(f"Sender captcha detected ({stage}), instant click attempt sent.")
+        try:
+            page.wait_for_timeout(120)
+        except Exception:  # noqa: BLE001
+            pass
+        if not _sender_captcha_visible(page):
+            _progress("Captcha disappeared after instant click. Continuing sender.")
+            return
+
+    if clicked_any:
+        _progress("Captcha still visible after instant click attempts.")
+
+    raise SenderCaptchaDetected(f"Captcha detected during sender ({stage}).")
 
 
 def _safe_click_next(page: Page) -> bool:
@@ -1417,12 +1500,17 @@ def recreate_ads_profile_after_sender_captcha(*, old_profile_id: str, profile_na
     new_profile_name = (
         f"{SENDER_CAPTCHA_PROFILE_NAME_PREFIX}-{_slugify(profile_name)}-{int(time.time())}"
     )
+    screen_width, screen_height = _parse_screen_resolution(SENDER_CAPTCHA_DESKTOP_SCREEN)
     new_profile_id = ads_client.create_profile_with_socks5(
         profile_name=new_profile_name,
         proxy_host=SENDER_CAPTCHA_PROXY_HOST,
         proxy_port=int(SENDER_CAPTCHA_PROXY_PORT),
         proxy_user=SENDER_CAPTCHA_PROXY_USER,
         proxy_password=SENDER_CAPTCHA_PROXY_PASSWORD,
+        desktop_screen_width=screen_width,
+        desktop_screen_height=screen_height,
+        desktop_os=SENDER_CAPTCHA_DESKTOP_OS,
+        desktop_user_agent=SENDER_CAPTCHA_DESKTOP_UA,
     )
     _progress(f"New ADS profile created for sender recovery: {new_profile_id}")
     return new_profile_id
@@ -1804,6 +1892,20 @@ def _select_first_available_time(page: Page, max_months_ahead: int = 6) -> bool:
     return _is_booking_form_visible(page)
 
 
+def _wait_booking_confirmation_with_captcha_guard(page: Page, timeout_ms: int = 25_000) -> None:
+    deadline = time.time() + (timeout_ms / 1000)
+    while time.time() < deadline:
+        _raise_sender_captcha(page, "confirmation polling")
+        try:
+            marker = page.locator("text=/scheduled|confirmed|you are scheduled/i").first
+            if marker.count() > 0 and marker.is_visible():
+                return
+        except Exception:  # noqa: BLE001
+            pass
+        _pause(page, 80)
+    raise CalendlyAutomationError("Booking confirmation timeout.")
+
+
 def _fill_booking_form(page: Page, invitee_name: str, invitee_email: str, guest_emails: list[str]) -> None:
     _progress("Filling Enter Details form.")
     _raise_sender_captcha(page, "booking form opened")
@@ -1976,7 +2078,7 @@ def _fill_booking_form(page: Page, invitee_name: str, invitee_email: str, guest_
     _progress("Waiting booking confirmation.")
     try:
         _raise_sender_captcha(page, "after schedule click")
-        page.wait_for_selector("text=/scheduled|confirmed|you are scheduled/i", timeout=25_000)
+        _wait_booking_confirmation_with_captcha_guard(page, timeout_ms=25_000)
         time.sleep(max(0, SCHEDULE_CONFIRM_EXTRA_WAIT_SECONDS))
         _raise_sender_captcha(page, "waiting confirmation")
     except Exception as exc:  # noqa: BLE001
