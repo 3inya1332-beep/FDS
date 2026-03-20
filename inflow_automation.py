@@ -149,6 +149,13 @@ class InflowUi:
             self.page.get_by_text(re.compile(r"^Email$", re.I)),
         ]
 
+    def _purchase_order_candidates(self) -> list[Locator]:
+        return [
+            self.page.get_by_role("menuitem", name=re.compile(r"Purchase order", re.I)),
+            self.page.get_by_role("button", name=re.compile(r"Purchase order", re.I)),
+            self.page.get_by_text(re.compile(r"^Purchase order$", re.I)),
+        ]
+
     def maximize_window(self) -> None:
         try:
             self.page.bring_to_front()
@@ -224,7 +231,7 @@ class InflowUi:
                 continue
         raise InflowAutomationError(f"Не удалось нажать: {description}")
 
-    def _visible_dialog(self) -> Locator:
+    def _visible_dialog(self, timeout_ms: int = 20_000) -> Locator:
         candidates = [
             self.page.locator('div[role="dialog"]:visible').last,
             self.page.locator(".modal:visible").last,
@@ -233,33 +240,59 @@ class InflowUi:
             try:
                 if dialog.count() == 0:
                     continue
-                dialog.wait_for(state="visible", timeout=20_000)
+                dialog.wait_for(state="visible", timeout=timeout_ms)
                 return dialog
             except Exception:  # noqa: BLE001
                 continue
         raise InflowAutomationError("Не удалось найти открытое окно отправки письма.")
 
+    def _visible_dialog_or_none(self) -> Locator | None:
+        try:
+            return self._visible_dialog(timeout_ms=800)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def has_send_dialog_open(self) -> bool:
+        return self._visible_dialog_or_none() is not None
+
     def open_purchase_order_modal(self) -> Locator:
+        already_open = self._visible_dialog_or_none()
+        if already_open is not None:
+            return already_open
+
         last_error: Exception | None = None
-        for _ in range(3):
+        # Click Email only once, and if modal didn't open in 20s - click one more time.
+        for attempt in range(2):
             try:
                 self.wait_until_ready(timeout_ms=25_000)
                 self._click_first_available(self._email_button_candidates(), "кнопка Email")
-                self._click_first_available(
-                    [
-                        self.page.get_by_role("menuitem", name=re.compile(r"Purchase order", re.I)),
-                        self.page.get_by_role("button", name=re.compile(r"Purchase order", re.I)),
-                        self.page.get_by_text(re.compile(r"^Purchase order$", re.I)),
-                    ],
-                    "пункт Purchase order",
-                )
-                return self._visible_dialog()
+                self._click_first_available(self._purchase_order_candidates(), "пункт Purchase order")
+                return self._visible_dialog(timeout_ms=20_000)
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
-                self.page.wait_for_timeout(1200)
+                if attempt == 0:
+                    self.page.wait_for_timeout(20_000)
         raise InflowAutomationError(f"Не удалось открыть окно Purchase order: {last_error}")
 
-    def _fill_input(self, dialog: Locator, *, value: str, label: str, placeholder_pattern: str, fallback_index: int) -> None:
+    def _type_into_field(self, field: Locator, value: str, *, confirm_with_enter: bool) -> None:
+        field.scroll_into_view_if_needed()
+        field.click()
+        self.page.keyboard.press("Control+A")
+        self.page.keyboard.press("Backspace")
+        self.page.keyboard.type(value, delay=14)
+        if confirm_with_enter:
+            self.page.keyboard.press("Enter")
+
+    def _fill_input(
+        self,
+        dialog: Locator,
+        *,
+        value: str,
+        label: str,
+        placeholder_pattern: str,
+        fallback_index: int,
+        confirm_with_enter: bool,
+    ) -> None:
         candidates: list[Locator] = []
 
         if placeholder_pattern:
@@ -275,6 +308,14 @@ class InflowUi:
                     "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), "
                     f"'{label.lower()}')]/following::input[1]"
                 ),
+                dialog.locator(
+                    f"xpath=.//*[normalize-space(text())='{label}']/following::*[@contenteditable='true'][1]"
+                ),
+                dialog.locator(
+                    "xpath=.//*[contains(translate(normalize-space(text()), "
+                    "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), "
+                    f"'{label.lower()}')]/following::*[@contenteditable='true'][1]"
+                ),
             ]
         )
 
@@ -288,7 +329,7 @@ class InflowUi:
                     continue
                 field = locator.first
                 field.wait_for(state="visible", timeout=5_000)
-                field.fill(value)
+                self._type_into_field(field, value, confirm_with_enter=confirm_with_enter)
                 return
             except Exception:  # noqa: BLE001
                 continue
@@ -296,22 +337,42 @@ class InflowUi:
         raise InflowAutomationError(f"Не удалось заполнить поле {label}.")
 
     def _fill_message(self, dialog: Locator, message: str) -> None:
-        editable = dialog.locator("[contenteditable='true']")
-        if editable.count() > 0:
-            field = editable.first
+        label_area = dialog.locator(
+            "xpath=.//*[contains(translate(normalize-space(text()), "
+            "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'document')]/following::*"
+            "[@contenteditable='true' or self::textarea][1]"
+        )
+        if label_area.count() > 0:
+            field = label_area.first
             field.wait_for(state="visible", timeout=8_000)
-            field.click()
-            self.page.keyboard.press("Control+A")
-            self.page.keyboard.press("Backspace")
-            self.page.keyboard.type(message, delay=5)
+            self._type_into_field(field, message, confirm_with_enter=False)
             return
 
-        textarea = dialog.locator("textarea")
-        if textarea.count() > 0:
-            field = textarea.first
-            field.wait_for(state="visible", timeout=8_000)
-            field.fill(message)
-            return
+        textareas = dialog.locator("textarea")
+        for idx in range(textareas.count()):
+            try:
+                field = textareas.nth(idx)
+                if not field.is_visible():
+                    continue
+                box = field.bounding_box()
+                if box and box.get("height", 0) >= 80:
+                    self._type_into_field(field, message, confirm_with_enter=False)
+                    return
+            except Exception:  # noqa: BLE001
+                continue
+
+        editables = dialog.locator("[contenteditable='true']")
+        for idx in range(editables.count()):
+            try:
+                field = editables.nth(idx)
+                if not field.is_visible():
+                    continue
+                box = field.bounding_box()
+                if box and box.get("height", 0) >= 80:
+                    self._type_into_field(field, message, confirm_with_enter=False)
+                    return
+            except Exception:  # noqa: BLE001
+                continue
 
         raise InflowAutomationError("Не удалось найти поле MESSAGE.")
 
@@ -331,6 +392,7 @@ class InflowUi:
             label="To",
             placeholder_pattern=r"to.*email",
             fallback_index=1,
+            confirm_with_enter=True,
         )
         self._fill_input(
             dialog,
@@ -338,6 +400,7 @@ class InflowUi:
             label="Cc",
             placeholder_pattern=r"cc.*email",
             fallback_index=2,
+            confirm_with_enter=True,
         )
         self._fill_input(
             dialog,
@@ -345,6 +408,7 @@ class InflowUi:
             label="Bcc",
             placeholder_pattern=r"bcc.*email",
             fallback_index=3,
+            confirm_with_enter=True,
         )
         self._fill_input(
             dialog,
@@ -352,6 +416,7 @@ class InflowUi:
             label="Subject",
             placeholder_pattern=r"subject",
             fallback_index=4,
+            confirm_with_enter=False,
         )
         self._fill_message(dialog, message)
 
@@ -431,7 +496,8 @@ def run_job(profile: Profile) -> RunStats:
                         )
                         try:
                             ui.maximize_window()
-                            ui.wait_until_ready(timeout_ms=25_000)
+                            if not ui.has_send_dialog_open():
+                                ui.wait_until_ready(timeout_ms=12_000)
                         except Exception as heal_exc:  # noqa: BLE001
                             _write_log(f"Recovery wait failed: {heal_exc}")
                         self_heal_delay = 1.5 + attempt
