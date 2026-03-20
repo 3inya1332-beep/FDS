@@ -300,20 +300,73 @@ class AdsApiClient:
         )
         return payload
 
+    @staticmethod
+    def _desktop_fingerprint_config() -> dict[str, Any]:
+        # Force desktop/browser profile to avoid accidental mobile UI mode.
+        return {
+            "automatic_timezone": "1",
+            "webrtc": "proxy",
+            "language": ["en-US", "en"],
+            "screen_resolution": "1920_1080",
+            "ua": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+            "browser_kernel_config": {"type": "chrome", "version": "ua_auto"},
+            "random_ua": {
+                "ua_browser": ["chrome"],
+                "ua_system_version": ["Windows 10", "Windows 11"],
+            },
+        }
+
     def create_profile(self, name: str, proxy_config: dict[str, str] | None = None) -> str:
         profile_name = name.strip()
         if not profile_name:
             raise AdsApiError("ADS profile name cannot be empty.")
 
-        payload_name = self._apply_proxy_payload({"name": profile_name, "group_id": "0"}, proxy_config)
-        payload_user_name = self._apply_proxy_payload({"user_name": profile_name, "group_id": "0"}, proxy_config)
-        payload_profile_name = self._apply_proxy_payload({"name": profile_name}, proxy_config)
+        desktop_fp = self._desktop_fingerprint_config()
+        minimal_desktop_fp = {
+            "automatic_timezone": "1",
+            "webrtc": "proxy",
+            "language": ["en-US", "en"],
+            "screen_resolution": "1920_1080",
+            "ua": desktop_fp["ua"],
+        }
+        payload_name = self._apply_proxy_payload(
+            {"name": profile_name, "group_id": "0", "fingerprint_config": desktop_fp},
+            proxy_config,
+        )
+        payload_user_name = self._apply_proxy_payload(
+            {"user_name": profile_name, "group_id": "0", "fingerprint_config": desktop_fp},
+            proxy_config,
+        )
+        payload_profile_name = self._apply_proxy_payload(
+            {"name": profile_name, "fingerprint_config": desktop_fp},
+            proxy_config,
+        )
+        payload_name_min = self._apply_proxy_payload(
+            {"name": profile_name, "group_id": "0", "fingerprint_config": minimal_desktop_fp},
+            proxy_config,
+        )
+        payload_user_name_min = self._apply_proxy_payload(
+            {"user_name": profile_name, "group_id": "0", "fingerprint_config": minimal_desktop_fp},
+            proxy_config,
+        )
+        payload_profile_name_min = self._apply_proxy_payload(
+            {"name": profile_name, "fingerprint_config": minimal_desktop_fp},
+            proxy_config,
+        )
 
         create_variants = [
             ("POST", "/api/v1/user/create", {"json": payload_name}),
             ("POST", "/api/v1/user/create", {"json": payload_user_name}),
             ("POST", "/api/v1/profile/create", {"json": payload_profile_name}),
             ("POST", "/api/v1/profiles/create", {"json": payload_profile_name}),
+            ("POST", "/api/v1/user/create", {"json": payload_name_min}),
+            ("POST", "/api/v1/user/create", {"json": payload_user_name_min}),
+            ("POST", "/api/v1/profile/create", {"json": payload_profile_name_min}),
+            ("POST", "/api/v1/profiles/create", {"json": payload_profile_name_min}),
             ("GET", "/api/v1/user/create", {"params": {"name": profile_name, "group_id": "0"}}),
             ("GET", "/api/v1/profile/create", {"params": {"name": profile_name}}),
         ]
