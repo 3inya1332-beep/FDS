@@ -35,10 +35,12 @@ class AdsApiClient:
         headers = {"Accept": "application/json"}
         if self.api_key and self.api_key != "PASTE_YOUR_ADS_API_KEY":
             # Different ADS API builds may use one of these headers.
-            headers["Authorization"] = self.api_key
+            headers["Authorization"] = f"Bearer {self.api_key}"
+            headers["X-AUTHORIZATION"] = self.api_key
             headers["X-API-KEY"] = self.api_key
             headers["api-key"] = self.api_key
             headers["api_key"] = self.api_key
+            headers["apikey"] = self.api_key
         return headers
 
     def _request(self, method: str, path: str, *, retry_on_rate_limit: int = 2, **kwargs: Any) -> dict[str, Any]:
@@ -47,7 +49,18 @@ class AdsApiClient:
             # Some ADS API builds accept key only as query param.
             params.setdefault("api-key", self.api_key)
             params.setdefault("api_key", self.api_key)
+            params.setdefault("apikey", self.api_key)
+            params.setdefault("apiKey", self.api_key)
         kwargs["params"] = params
+
+        json_payload = kwargs.get("json")
+        if isinstance(json_payload, dict) and self.api_key and self.api_key != "PASTE_YOUR_ADS_API_KEY":
+            # Other ADS builds accept key in body.
+            json_payload.setdefault("api-key", self.api_key)
+            json_payload.setdefault("api_key", self.api_key)
+            json_payload.setdefault("apikey", self.api_key)
+            json_payload.setdefault("apiKey", self.api_key)
+            kwargs["json"] = json_payload
 
         url = f"{self.base_url}{path}"
         attempts = max(0, retry_on_rate_limit) + 1
@@ -135,6 +148,11 @@ class AdsApiClient:
                 {"params": {"profile_id": profile_id, "headless": int(headless), "open_tabs": open_tabs}},
             ),
             (
+                "GET",
+                "/api/v1/browser/start",
+                {"params": {"id": profile_id, "headless": int(headless), "open_tabs": open_tabs}},
+            ),
+            (
                 "POST",
                 "/api/v1/browser/start",
                 {"json": {"user_id": profile_id, "headless": int(headless), "open_tabs": open_tabs}},
@@ -143,6 +161,26 @@ class AdsApiClient:
                 "POST",
                 "/api/v1/browser/start",
                 {"json": {"profile_id": profile_id, "headless": int(headless), "open_tabs": open_tabs}},
+            ),
+            (
+                "POST",
+                "/api/v1/browser/start",
+                {"json": {"id": profile_id, "headless": int(headless), "open_tabs": open_tabs}},
+            ),
+            (
+                "GET",
+                "/api/v1/browser/open",
+                {"params": {"user_id": profile_id, "headless": int(headless), "open_tabs": open_tabs}},
+            ),
+            (
+                "GET",
+                "/api/v1/browser/open",
+                {"params": {"profile_id": profile_id, "headless": int(headless), "open_tabs": open_tabs}},
+            ),
+            (
+                "GET",
+                "/api/v1/browser/open",
+                {"params": {"id": profile_id, "headless": int(headless), "open_tabs": open_tabs}},
             ),
         ]
 
@@ -171,8 +209,13 @@ class AdsApiClient:
         stop_variants = [
             ("GET", "/api/v1/browser/stop", {"params": {"user_id": profile_id}}),
             ("GET", "/api/v1/browser/stop", {"params": {"profile_id": profile_id}}),
+            ("GET", "/api/v1/browser/stop", {"params": {"id": profile_id}}),
             ("POST", "/api/v1/browser/stop", {"json": {"user_id": profile_id}}),
             ("POST", "/api/v1/browser/stop", {"json": {"profile_id": profile_id}}),
+            ("POST", "/api/v1/browser/stop", {"json": {"id": profile_id}}),
+            ("GET", "/api/v1/browser/close", {"params": {"user_id": profile_id}}),
+            ("GET", "/api/v1/browser/close", {"params": {"profile_id": profile_id}}),
+            ("GET", "/api/v1/browser/close", {"params": {"id": profile_id}}),
         ]
         for method, path, kwargs in stop_variants:
             try:
