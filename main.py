@@ -105,26 +105,33 @@ def show_api_settings(settings_store: RuntimeSettingsStore) -> None:
     _print_box(lines, title="API / PROXY SETTINGS")
 
 
-def setup_api_flow(settings_store: RuntimeSettingsStore) -> None:
+def _setup_ads_api_flow(settings_store: RuntimeSettingsStore) -> None:
     settings = settings_store.load()
-    print("\n⚙️ НАСТРОЙКА API (ADS + PROXY + ANYMESSAGE)")
-
     settings.ads_api_base = input(f"ADS API BASE [{settings.ads_api_base}]: ").strip() or settings.ads_api_base
-
     ads_key = input(f"ADS API KEY [{_mask_secret(settings.ads_api_key)}]: ").strip()
     if ads_key:
         settings.ads_api_key = ads_key
+    settings_store.save(settings)
+    print("✅ ADS API настройки сохранены.")
 
+
+def _setup_anymessage_api_flow(settings_store: RuntimeSettingsStore) -> None:
+    settings = settings_store.load()
     settings.anymessage_api_base = (
         input(f"ANYMESSAGE API BASE [{settings.anymessage_api_base}]: ").strip() or settings.anymessage_api_base
     )
-
     anymessage_token = input(f"ANYMESSAGE TOKEN [{_mask_secret(settings.anymessage_api_token)}]: ").strip()
     if anymessage_token:
         settings.anymessage_api_token = anymessage_token
+    settings.anymessage_service = (
+        input(f"ANYMESSAGE SERVICE [{settings.anymessage_service}]: ").strip() or settings.anymessage_service
+    )
+    settings_store.save(settings)
+    print("✅ AnyMessage API настройки сохранены.")
 
-    settings.anymessage_service = input(f"ANYMESSAGE SERVICE [{settings.anymessage_service}]: ").strip() or settings.anymessage_service
 
+def _setup_proxy_flow(settings_store: RuntimeSettingsStore) -> None:
+    settings = settings_store.load()
     settings.proxy_enabled = ask_yes_no(
         f"Включить PROXY? [{'Y/n' if settings.proxy_enabled else 'y/N'}]: ",
         default=settings.proxy_enabled,
@@ -145,9 +152,33 @@ def setup_api_flow(settings_store: RuntimeSettingsStore) -> None:
         settings.proxy_port = ""
         settings.proxy_username = ""
         settings.proxy_password = ""
-
     settings_store.save(settings)
-    print("✅ Настройки API сохранены.")
+    print("✅ Proxy настройки сохранены.")
+
+
+def setup_api_flow(settings_store: RuntimeSettingsStore) -> None:
+    while True:
+        clear_console()
+        show_api_settings(settings_store)
+        print("\n⚙️ НАСТРОЙКА API (ВЫБОР БЛОКА)")
+        print("1. API ADS")
+        print("2. API AnyMessage")
+        print("3. API PROXY")
+        print("0. Назад")
+        choice = input("\n👉 Выберите блок: ").strip()
+
+        if choice == "1":
+            _setup_ads_api_flow(settings_store)
+        elif choice == "2":
+            _setup_anymessage_api_flow(settings_store)
+        elif choice == "3":
+            _setup_proxy_flow(settings_store)
+        elif choice == "0":
+            return
+        else:
+            print("⚠️ Неизвестный пункт.")
+
+        input("\nНажмите Enter, чтобы продолжить...")
 
 
 def add_profile_flow(store: ProfileStore) -> None:
