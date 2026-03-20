@@ -33,6 +33,8 @@ from config import (
     MESSAGE_FILENAME,
     ANYMESSAGE_API_BASE,
     ANYMESSAGE_SERVICE,
+    PROXY_FORCE_HOST,
+    PROXY_FORCE_PORT,
     SEND_DELAY_SECONDS,
     SUBJECT_FILENAME,
     UK_PHONE_DIGITS,
@@ -235,7 +237,11 @@ def _resolve_best_proxy(settings: RuntimeSettings) -> dict[str, str] | None:
         )
     else:
         _write_log(f"Proxy selected: {candidate.proxy_host}:{candidate.proxy_port} (ping not provided)")
-    return candidate.to_ads_payload()
+    payload = candidate.to_ads_payload()
+    payload["proxy_host"] = PROXY_FORCE_HOST
+    payload["proxy_port"] = PROXY_FORCE_PORT
+    _write_log(f"Proxy endpoint forced to local gateway: {PROXY_FORCE_HOST}:{PROXY_FORCE_PORT}")
+    return payload
 
 
 def _random_password(length: int = 14) -> str:

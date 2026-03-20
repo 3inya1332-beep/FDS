@@ -9,6 +9,7 @@ from config import (
     ANYMESSAGE_API_TOKEN,
     API_KEY,
     BASE_DIR,
+    PROXY_API_DEFAULT_URL,
 )
 
 
@@ -19,7 +20,7 @@ SETTINGS_PATH = BASE_DIR / "runtime_settings.json"
 class RuntimeSettings:
     ads_api_key: str = API_KEY
     anymessage_api_token: str = ANYMESSAGE_API_TOKEN
-    proxy_api_url: str = "http://127.0.0.1:10101/api/proxy?t=2&num=1"
+    proxy_api_url: str = PROXY_API_DEFAULT_URL
 
 
 class RuntimeSettingsStore:
