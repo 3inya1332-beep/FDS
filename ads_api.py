@@ -31,17 +31,22 @@ class AdsApiClient:
         self.api_key = api_key.strip()
         self.timeout_seconds = timeout_seconds
 
-    def _headers(self) -> dict[str, str]:
-        headers = {"Accept": "application/json"}
-        if self.api_key and self.api_key != "PASTE_YOUR_ADS_API_KEY":
-            # Different ADS API builds may use one of these headers.
-            headers["Authorization"] = f"Bearer {self.api_key}"
-            headers["X-AUTHORIZATION"] = self.api_key
-            headers["X-API-KEY"] = self.api_key
-            headers["api-key"] = self.api_key
-            headers["api_key"] = self.api_key
-            headers["apikey"] = self.api_key
-        return headers
+    def _header_variants(self) -> list[dict[str, str]]:
+        headers_base = {"Accept": "application/json"}
+        if not self.api_key or self.api_key == "PASTE_YOUR_ADS_API_KEY":
+            return [headers_base]
+
+        common = {
+            "X-AUTHORIZATION": self.api_key,
+            "X-API-KEY": self.api_key,
+            "api-key": self.api_key,
+            "api_key": self.api_key,
+            "apikey": self.api_key,
+        }
+        return [
+            {**headers_base, **common, "Authorization": f"Bearer {self.api_key}"},
+            {**headers_base, **common, "Authorization": self.api_key},
+        ]
 
     def _request(self, method: str, path: str, *, retry_on_rate_limit: int = 2, **kwargs: Any) -> dict[str, Any]:
         params = dict(kwargs.pop("params", {}) or {})
@@ -64,23 +69,28 @@ class AdsApiClient:
 
         url = f"{self.base_url}{path}"
         attempts = max(0, retry_on_rate_limit) + 1
-        for attempt in range(attempts):
-            response = requests.request(
-                method=method.upper(),
-                url=url,
-                timeout=self.timeout_seconds,
-                headers=self._headers(),
-                **kwargs,
-            )
-            response.raise_for_status()
-            payload = response.json()
-            if not isinstance(payload, dict):
-                raise AdsApiError(f"Unexpected ADS API response: {payload!r}")
+        for headers in self._header_variants():
+            for attempt in range(attempts):
+                response = requests.request(
+                    method=method.upper(),
+                    url=url,
+                    timeout=self.timeout_seconds,
+                    headers=headers,
+                    **kwargs,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                if not isinstance(payload, dict):
+                    raise AdsApiError(f"Unexpected ADS API response: {payload!r}")
 
-            if self._is_rate_limited(payload) and attempt < attempts - 1:
-                time.sleep(1.2 * (attempt + 1))
-                continue
-            return payload
+                if self._is_rate_limited(payload) and attempt < attempts - 1:
+                    time.sleep(1.2 * (attempt + 1))
+                    continue
+
+                if self._requires_api_key(payload):
+                    # Retry with another auth header format.
+                    break
+                return payload
 
         raise AdsApiError("ADS API request failed after retries.")
 
@@ -128,6 +138,11 @@ class AdsApiClient:
     def _is_rate_limited(payload: dict[str, Any]) -> bool:
         message = str(payload.get("msg", "") or payload.get("message", "")).lower()
         return "too many request" in message or "rate limit" in message
+
+    @staticmethod
+    def _requires_api_key(payload: dict[str, Any]) -> bool:
+        message = str(payload.get("msg", "") or payload.get("message", "")).lower()
+        return "require api-key" in message or "require api key" in message
 
     def start_browser(
         self,
