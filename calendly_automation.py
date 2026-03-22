@@ -73,6 +73,7 @@ from config import (
     SENDER_CAPTCHA_PROXY_ROTATE_URL,
     SENDER_CAPTCHA_PROXY_TYPE,
     SENDER_CAPTCHA_PROXY_USER,
+    SENDER_PARALLEL_TABS,
     SENT_EMAILS_DIR,
     SENT_EMAILS_FILENAME,
     SIGNUP_INITIAL_DELAY_SECONDS,
@@ -2324,59 +2325,76 @@ def run_booking_sender(
     scheduled = 0
     consumed = 0
     used_invitee_names: set[str] = set()
+    parallel_tabs = 1 if single_target_email else max(1, int(SENDER_PARALLEL_TABS))
 
     with open_ads_page(profile.ads_profile_id) as (page, context):
         _load_cookies_if_present(context, profile.cookie_file)
+        pages: list[Page] = [page]
+        for _ in range(max(0, parallel_tabs - 1)):
+            worker_page = context.new_page()
+            worker_page.set_default_timeout(8_000)
+            worker_page.set_default_navigation_timeout(45_000)
+            pages.append(worker_page)
+        _progress(f"Sender parallel tabs enabled: {len(pages)}")
 
         while email_pool:
-            _progress(f"Opening booking page: {target_booking_url}")
-            _safe_goto_calendly(page, target_booking_url, timeout_ms=60_000)
-            _pause(page, 250)
-            _dismiss_cookie_banner(page)
-            _raise_sender_captcha(page, "booking page opened")
-            _wait_booking_calendar_ready(page, timeout_seconds=12)
-            _raise_sender_captcha(page, "calendar ready")
+            active_count = min(len(pages), len(email_pool))
+            current_batch = email_pool[:active_count]
+            successful_batch: list[str] = []
+            stop_on_slots = False
 
-            _progress("Selecting first available date and time.")
-            slot_selected = False
-            for slot_attempt in range(1, 4):
-                _raise_sender_captcha(page, f"slot attempt {slot_attempt} start")
-                if _select_first_available_time(page):
-                    slot_selected = True
+            for idx, invitee_email in enumerate(current_batch):
+                current_page = pages[idx]
+                _progress(f"[Tab {idx + 1}/{len(pages)}] Opening booking page: {target_booking_url}")
+                _safe_goto_calendly(current_page, target_booking_url, timeout_ms=60_000)
+                _pause(current_page, 250)
+                _dismiss_cookie_banner(current_page)
+                _raise_sender_captcha(current_page, f"tab {idx + 1} booking page opened")
+                _wait_booking_calendar_ready(current_page, timeout_seconds=12)
+                _raise_sender_captcha(current_page, f"tab {idx + 1} calendar ready")
+
+                _progress(f"[Tab {idx + 1}] Selecting first available date and time.")
+                slot_selected = False
+                for slot_attempt in range(1, 4):
+                    _raise_sender_captcha(current_page, f"tab {idx + 1} slot attempt {slot_attempt} start")
+                    if _select_first_available_time(current_page):
+                        slot_selected = True
+                        break
+                    _raise_sender_captcha(current_page, f"tab {idx + 1} slot attempt {slot_attempt} failed")
+                    _progress(f"[Tab {idx + 1}] Slot attempt {slot_attempt}/3 failed, waiting and retrying.")
+                    _pause(current_page, 500)
+
+                if not slot_selected:
+                    _progress(f"[Tab {idx + 1}] No available slots found now. Sender stopped without error.")
+                    stop_on_slots = True
                     break
-                _raise_sender_captcha(page, f"slot attempt {slot_attempt} failed")
-                _progress(f"Slot attempt {slot_attempt}/3 failed, waiting and retrying.")
-                _pause(page, 500)
 
-            if not slot_selected:
-                _progress("No available slots found now. Sender stopped without error.")
+                invitee_name = _generate_real_invitee_name(used_invitee_names)
+                _fill_booking_form(
+                    current_page,
+                    invitee_name=invitee_name,
+                    invitee_email=invitee_email,
+                    guest_emails=[],
+                )
+                successful_batch.append(invitee_email)
+                consumed += 1
+                scheduled += 1
+                _progress(f"[Tab {idx + 1}] Booking scheduled: invitee={invitee_email}")
+
+            if successful_batch:
+                if persist_sent:
+                    _append_sent_emails_file(successful_batch)
+                    _save_sent_emails_db(successful_batch)
+                email_pool = email_pool[len(successful_batch) :]
+                if not single_target_email:
+                    save_email_pool(email_pool)
+
+            if stop_on_slots:
+                break
+            if not successful_batch:
+                # Guard against infinite loop if nothing was sent in this batch.
                 break
 
-            invitee_email = email_pool[0]
-            # Per current sending requirement: one invite per booking (Name + Email only).
-            guest_emails: list[str] = []
-            invitee_name = _generate_real_invitee_name(used_invitee_names)
-
-            _fill_booking_form(
-                page,
-                invitee_name=invitee_name,
-                invitee_email=invitee_email,
-                guest_emails=guest_emails,
-            )
-
-            used = 1
-            consumed += used
-            scheduled += 1
-
-            sent_batch = [invitee_email]
-            if persist_sent:
-                _append_sent_emails_file(sent_batch)
-                _save_sent_emails_db(sent_batch)
-
-            email_pool = email_pool[used:]
-            if not single_target_email:
-                save_email_pool(email_pool)
-            _progress(f"Booking scheduled: invitee={invitee_email}; guests={len(guest_emails)}")
             time.sleep(max(0, SEND_BETWEEN_BOOKINGS_SECONDS))
 
         cookie_file = _save_cookies(context, profile.name)
