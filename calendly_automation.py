@@ -2113,7 +2113,40 @@ def _wait_booking_confirmation_with_captcha_guard(page: Page, timeout_ms: int = 
     raise CalendlyAutomationError("Booking confirmation timeout.")
 
 
-def _fill_booking_form(page: Page, invitee_name: str, invitee_email: str, guest_emails: list[str]) -> None:
+def _submit_booking_form(page: Page) -> None:
+    if not _click_first(
+        page,
+        selectors=[
+            "button:has-text('Schedule Event')",
+            "button:has-text('Schedule')",
+            "button[type='submit']",
+        ],
+        timeout=10_000,
+    ):
+        _raise_sender_captcha(page, "before schedule click")
+        raise CalendlyAutomationError("Schedule button not found.")
+
+
+def _wait_booking_confirmation(page: Page) -> None:
+    _progress("Waiting booking confirmation.")
+    try:
+        _raise_sender_captcha(page, "after schedule click")
+        _wait_booking_confirmation_with_captcha_guard(page, timeout_ms=25_000)
+        time.sleep(max(0, SCHEDULE_CONFIRM_EXTRA_WAIT_SECONDS))
+        _raise_sender_captcha(page, "waiting confirmation")
+    except Exception as exc:  # noqa: BLE001
+        _raise_sender_captcha(page, "confirmation wait failed")
+        raise CalendlyAutomationError("Booking confirmation was not detected.") from exc
+
+
+def _fill_booking_form(
+    page: Page,
+    invitee_name: str,
+    invitee_email: str,
+    guest_emails: list[str],
+    *,
+    submit_and_wait: bool = True,
+) -> None:
     _progress("Filling Enter Details form.")
     _raise_sender_captcha(page, "booking form opened")
 
@@ -2280,27 +2313,10 @@ def _fill_booking_form(page: Page, invitee_name: str, invitee_email: str, guest_
         else:
             _progress("Guest input not found after Add Guests; continuing with main invitee email only.")
 
-    if not _click_first(
-        page,
-        selectors=[
-            "button:has-text('Schedule Event')",
-            "button:has-text('Schedule')",
-            "button[type='submit']",
-        ],
-        timeout=10_000,
-    ):
-        _raise_sender_captcha(page, "before schedule click")
-        raise CalendlyAutomationError("Schedule button not found.")
-
-    _progress("Waiting booking confirmation.")
-    try:
-        _raise_sender_captcha(page, "after schedule click")
-        _wait_booking_confirmation_with_captcha_guard(page, timeout_ms=25_000)
-        time.sleep(max(0, SCHEDULE_CONFIRM_EXTRA_WAIT_SECONDS))
-        _raise_sender_captcha(page, "waiting confirmation")
-    except Exception as exc:  # noqa: BLE001
-        _raise_sender_captcha(page, "confirmation wait failed")
-        raise CalendlyAutomationError("Booking confirmation was not detected.") from exc
+    if not submit_and_wait:
+        return
+    _submit_booking_form(page)
+    _wait_booking_confirmation(page)
 
 
 def run_booking_sender(
@@ -2343,14 +2359,15 @@ def run_booking_sender(
         while email_pool:
             active_count = min(len(pages), len(email_pool))
             current_batch = email_pool[:active_count]
-            successful_batch: list[str] = []
+            ready_jobs: list[tuple[int, Page, str]] = []
             stop_on_slots = False
 
+            # Stage 1: prepare all tabs up to filled form.
             for idx, invitee_email in enumerate(current_batch):
                 current_page = pages[idx]
                 _progress(f"[Tab {idx + 1}/{len(pages)}] Opening booking page: {target_booking_url}")
                 _safe_goto_calendly(current_page, target_booking_url, timeout_ms=60_000)
-                _pause(current_page, 250)
+                _pause(current_page, 120)
                 _dismiss_cookie_banner(current_page)
                 _raise_sender_captcha(current_page, f"tab {idx + 1} booking page opened")
                 _wait_booking_calendar_ready(current_page, timeout_seconds=12)
@@ -2364,8 +2381,8 @@ def run_booking_sender(
                         slot_selected = True
                         break
                     _raise_sender_captcha(current_page, f"tab {idx + 1} slot attempt {slot_attempt} failed")
-                    _progress(f"[Tab {idx + 1}] Slot attempt {slot_attempt}/3 failed, waiting and retrying.")
-                    _pause(current_page, 500)
+                    _progress(f"[Tab {idx + 1}] Slot attempt {slot_attempt}/3 failed.")
+                    _pause(current_page, 200)
 
                 if not slot_selected:
                     _progress(f"[Tab {idx + 1}] No available slots found now. Sender stopped without error.")
@@ -2378,24 +2395,49 @@ def run_booking_sender(
                     invitee_name=invitee_name,
                     invitee_email=invitee_email,
                     guest_emails=[],
+                    submit_and_wait=False,
                 )
-                successful_batch.append(invitee_email)
-                consumed += 1
-                scheduled += 1
-                _progress(f"[Tab {idx + 1}] Booking scheduled: invitee={invitee_email}")
-
-            if successful_batch:
-                if persist_sent:
-                    _append_sent_emails_file(successful_batch)
-                    _save_sent_emails_db(successful_batch)
-                email_pool = email_pool[len(successful_batch) :]
-                if not single_target_email:
-                    save_email_pool(email_pool)
+                ready_jobs.append((idx, current_page, invitee_email))
 
             if stop_on_slots:
                 break
-            if not successful_batch:
-                # Guard against infinite loop if nothing was sent in this batch.
+            if not ready_jobs:
+                break
+
+            # Stage 2: fast submit wave across all ready tabs.
+            _progress(f"Submitting batch in parallel wave: {len(ready_jobs)} tabs.")
+            submitted_jobs: list[tuple[int, Page, str]] = []
+            for idx, current_page, invitee_email in ready_jobs:
+                _submit_booking_form(current_page)
+                submitted_jobs.append((idx, current_page, invitee_email))
+
+            # Stage 3: wait confirmations for all submitted tabs.
+            successful_batch: list[str] = []
+            failed_batch: list[str] = []
+            for idx, current_page, invitee_email in submitted_jobs:
+                try:
+                    _wait_booking_confirmation(current_page)
+                    successful_batch.append(invitee_email)
+                    _progress(f"[Tab {idx + 1}] Booking scheduled: invitee={invitee_email}")
+                except Exception as exc:  # noqa: BLE001
+                    failed_batch.append(invitee_email)
+                    _progress(f"[Tab {idx + 1}] Booking failed for {invitee_email}: {exc}")
+
+            if successful_batch and persist_sent:
+                _append_sent_emails_file(successful_batch)
+                _save_sent_emails_db(successful_batch)
+
+            # Keep failed emails for retry, remove only successful from current batch.
+            success_set = {email.lower() for email in successful_batch}
+            retriable_failed = [email for email in current_batch if email.lower() not in success_set]
+            email_pool = retriable_failed + email_pool[active_count:]
+            if not single_target_email:
+                save_email_pool(email_pool)
+
+            consumed += len(successful_batch)
+            scheduled += len(successful_batch)
+            if not successful_batch and failed_batch:
+                _progress("No successful bookings in this wave; stopping to avoid endless retry loop.")
                 break
 
             time.sleep(max(0, SEND_BETWEEN_BOOKINGS_SECONDS))
