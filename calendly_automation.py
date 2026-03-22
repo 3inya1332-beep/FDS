@@ -847,14 +847,17 @@ def _rotate_sender_proxy_for_recovery() -> None:
 
         latency_ms = _measure_sender_proxy_latency_ms()
         if latency_ms is None:
-            _progress(f"Proxy latency test failed ({attempt}/{attempts}), rotating again.")
-            continue
+            _progress("Proxy latency test failed; using this rotated proxy without extra rotations.")
+            return
 
         if best_ping is None or latency_ms < best_ping:
             best_ping = latency_ms
         _progress(f"Proxy latency after rotate ({attempt}/{attempts}): {latency_ms:.0f}ms")
         if latency_ms <= acceptable_ms:
             _progress(f"Proxy accepted by ping threshold: {latency_ms:.0f}ms <= {acceptable_ms}ms")
+            return
+        if attempt == attempts:
+            _progress("Proxy ping is higher than threshold, but max rotate attempts reached.")
             return
 
     if best_ping is not None:
