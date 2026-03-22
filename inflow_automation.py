@@ -800,10 +800,57 @@ class InflowUi:
             self.page.wait_for_timeout(180)
         raise InflowAutomationError(f"Не удалось найти поле ввода: {label_patterns}")
 
+    def _is_signup_verification_failed(self) -> bool:
+        candidates = [
+            self.page.get_by_text(re.compile(r"verification failed", re.I)),
+            self.page.locator("text=/cloudflare/i"),
+            self.page.locator("iframe[src*='turnstile'], iframe[title*='challenge' i]"),
+        ]
+        for locator in candidates:
+            try:
+                if locator.count() > 0 and locator.first.is_visible():
+                    return True
+            except Exception:  # noqa: BLE001
+                continue
+        return False
+
+    def _wait_signup_continue_ready(self, timeout_ms: int = 15_000) -> Locator:
+        deadline = time.time() + (timeout_ms / 1000)
+        candidates = [
+            self.page.get_by_role("button", name=re.compile(r"^continue$", re.I)),
+            self.page.locator("button[type='submit']"),
+            self.page.locator("button:has-text('Continue')"),
+            self.page.locator("input[type='submit']"),
+        ]
+        while time.time() < deadline:
+            if self._is_signup_verification_failed():
+                raise InflowAutomationError("Cloudflare verification failed on signup page.")
+            for locator in candidates:
+                try:
+                    if locator.count() == 0:
+                        continue
+                    button = locator.first
+                    if not button.is_visible():
+                        continue
+                    try:
+                        if button.is_disabled():
+                            continue
+                    except Exception:  # noqa: BLE001
+                        pass
+                    return button
+                except Exception:  # noqa: BLE001
+                    continue
+            self.page.wait_for_timeout(220)
+        raise InflowAutomationError("Кнопка Continue не стала активной на signup странице.")
+
     def _wait_signup_details_step(self, timeout_ms: int = 45_000) -> None:
         deadline = time.time() + (timeout_ms / 1000)
-        continue_retry = 0
         while time.time() < deadline:
+            if self._is_signup_verification_failed():
+                screenshot_path = self.capture_debug_screenshot("cloudflare_verification_failed")
+                note = f" | screenshot: {screenshot_path}" if screenshot_path else ""
+                raise InflowAutomationError(f"Cloudflare verification failed on signup page.{note}")
+
             details_candidates = [
                 self.page.locator("input[type='password']"),
                 self.page.locator("input[type='tel']"),
@@ -820,21 +867,6 @@ class InflowUi:
                         return
                 except Exception:  # noqa: BLE001
                     continue
-
-            # If still on email page, re-try Continue occasionally.
-            try:
-                email_input = self.page.locator("input[type='email'], input[name*='email' i], input[id*='email' i]").first
-                still_email = email_input.count() > 0 and email_input.is_visible()
-            except Exception:  # noqa: BLE001
-                still_email = False
-
-            if still_email and continue_retry < 3:
-                continue_retry += 1
-                try:
-                    self._click_by_text_patterns([r"^continue$", r"next"], timeout_ms=3_000)
-                    _write_log(f"Signup details wait: retried Continue click ({continue_retry}/3).")
-                except Exception:  # noqa: BLE001
-                    pass
 
             self.page.wait_for_timeout(350)
 
@@ -895,74 +927,16 @@ class InflowUi:
     def _signup_fill_email_and_continue(self, email: str) -> None:
         field = self._wait_signup_email_input(timeout_ms=25_000)
         self._type_into_field(field, email, confirm_with_enter=False)
-        self.page.wait_for_timeout(300)
-
-        def _is_still_email_step() -> bool:
-            try:
-                email_input = self.page.locator("input[type='email'], input[name*='email' i], input[id*='email' i]").first
-                return email_input.count() > 0 and email_input.is_visible()
-            except Exception:  # noqa: BLE001
-                return False
-
-        button_candidates = [
-            self.page.get_by_role("button", name=re.compile(r"^continue$", re.I)),
-            self.page.locator("button[type='submit']"),
-            self.page.locator("button:has-text('Continue')"),
-            self.page.locator("input[type='submit']"),
-        ]
-
-        for attempt in range(1, 6):
-            clicked = False
-            for locator in button_candidates:
-                try:
-                    if locator.count() == 0:
-                        continue
-                    button = locator.first
-                    if not button.is_visible():
-                        continue
-                    try:
-                        if button.is_disabled():
-                            continue
-                    except Exception:  # noqa: BLE001
-                        pass
-                    button.click(timeout=3_000)
-                    clicked = True
-                    break
-                except Exception:  # noqa: BLE001
-                    continue
-
-            if not clicked:
-                try:
-                    field.press("Enter")
-                    clicked = True
-                except Exception:  # noqa: BLE001
-                    pass
-
-            if clicked:
-                self.page.wait_for_timeout(800)
-                if not _is_still_email_step():
-                    return
-
-                # Fallback JS click when UI intercepts regular click.
-                try:
-                    self.page.evaluate(
-                        "() => {"
-                        "  const btn = Array.from(document.querySelectorAll('button,input[type=\"submit\"]'))"
-                        "    .find(el => /continue/i.test((el.innerText || el.value || '').trim()));"
-                        "  if (btn) { btn.click(); }"
-                        "}"
-                    )
-                except Exception:  # noqa: BLE001
-                    pass
-                self.page.wait_for_timeout(700)
-                if not _is_still_email_step():
-                    return
-
-            _write_log(f"Continue click retry on signup step: {attempt}/5")
-            self.maximize_window()
-            self.page.wait_for_timeout(450)
-
-        raise InflowAutomationError("Ввел Work email, но кнопка Continue не сработала после 5 попыток.")
+        # Let client-side validators finish before interacting with Continue.
+        self.page.wait_for_timeout(1_200)
+        continue_button = self._wait_signup_continue_ready(timeout_ms=18_000)
+        _write_log("Signup: page loaded, clicking Continue once.")
+        try:
+            continue_button.click(timeout=5_000)
+        except Exception:  # noqa: BLE001
+            # Single fallback only; avoid spam clicks that can trigger CAPTCHA.
+            field.press("Enter")
+        self.page.wait_for_timeout(900)
 
     def _wait_url_contains(self, expected_substring: str, timeout_ms: int = 20_000) -> None:
         deadline = time.time() + (timeout_ms / 1000)
