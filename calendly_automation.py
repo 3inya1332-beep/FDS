@@ -43,7 +43,6 @@ from config import (
     ANYMESSAGE_MAX_WAIT_SECONDS,
     ANYMESSAGE_POLL_SECONDS,
     BODY_FILENAME,
-    BOOKING_GUESTS_PER_EVENT,
     CALENDLY_MEETING_TYPES_URL,
     CALENDLY_SIGNUP_URL,
     CAPTCHA_MANUAL_TIMEOUT_SECONDS,
@@ -2354,8 +2353,8 @@ def run_booking_sender(
                 break
 
             invitee_email = email_pool[0]
-            guests_limit = 0 if single_target_email else min(BOOKING_GUESTS_PER_EVENT, max(len(email_pool) - 1, 0))
-            guest_emails = email_pool[1 : 1 + guests_limit]
+            # Per current sending requirement: one invite per booking (Name + Email only).
+            guest_emails: list[str] = []
             invitee_name = _generate_real_invitee_name(used_invitee_names)
 
             _fill_booking_form(
@@ -2365,11 +2364,11 @@ def run_booking_sender(
                 guest_emails=guest_emails,
             )
 
-            used = 1 + len(guest_emails)
+            used = 1
             consumed += used
             scheduled += 1
 
-            sent_batch = [invitee_email] + guest_emails
+            sent_batch = [invitee_email]
             if persist_sent:
                 _append_sent_emails_file(sent_batch)
                 _save_sent_emails_db(sent_batch)
