@@ -802,6 +802,79 @@ def _sender_captcha_visible(page: Page) -> bool:
     return False
 
 
+def _is_booking_confirmation_visible(page: Page) -> bool:
+    current_url = (page.url or "").lower()
+    success_url_parts = [
+        "/scheduled_events/",
+        "/invitees/",
+        "/invitee/",
+        "/bookings/",
+        "/events/",
+        "confirmation",
+    ]
+    if any(part in current_url for part in success_url_parts):
+        return True
+
+    success_text_selectors = [
+        "text=/you\\s*(are|'?re)\\s+scheduled/i",
+        "text=/booking\\s+confirmed/i",
+        "text=/event\\s+(is\\s+)?scheduled/i",
+        "text=/you'?re\\s+booked/i",
+        "text=/thanks\\s+for\\s+booking/i",
+        "text=/meeting\\s+scheduled/i",
+    ]
+    for selector in success_text_selectors:
+        locator = page.locator(selector).first
+        try:
+            if locator.count() > 0 and locator.is_visible():
+                return True
+        except Exception:  # noqa: BLE001
+            continue
+
+    post_book_actions = [
+        "a:has-text('Reschedule')",
+        "button:has-text('Reschedule')",
+        "a:has-text('Cancel')",
+        "button:has-text('Cancel')",
+        "text=/add to calendar/i",
+        "text=/event details/i",
+    ]
+    for selector in post_book_actions:
+        locator = page.locator(selector).first
+        try:
+            if locator.count() > 0 and locator.is_visible():
+                return True
+        except Exception:  # noqa: BLE001
+            continue
+
+    try:
+        return bool(
+            page.evaluate(
+                """
+                () => {
+                  const txt = (document.body?.innerText || '').toLowerCase();
+                  if (!txt) return false;
+                  const hasScheduled =
+                    /you\\s*(are|'?re)\\s+scheduled/.test(txt) ||
+                    /booking\\s+confirmed/.test(txt) ||
+                    /event\\s+(is\\s+)?scheduled/.test(txt) ||
+                    /you'?re\\s+booked/.test(txt) ||
+                    /thanks\\s+for\\s+booking/.test(txt) ||
+                    /meeting\\s+scheduled/.test(txt);
+                  const hasPostActions =
+                    txt.includes('reschedule') ||
+                    txt.includes('cancel event') ||
+                    txt.includes('add to calendar') ||
+                    txt.includes('event details');
+                  return hasScheduled || (hasPostActions && !txt.includes('schedule event'));
+                }
+                """
+            )
+        )
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _click_human_continue_modal(page: Page) -> bool:
     # Prioritize modal/button text from screenshot: "Confirm you're human" + "Continue"
     selectors = [
@@ -966,6 +1039,10 @@ def _rotate_sender_proxy_for_recovery(proxy_port: int) -> None:
 
 
 def _raise_sender_captcha(page: Page, stage: str) -> None:
+    # If booking is already confirmed, captcha checks should not interrupt sender flow.
+    if _is_booking_confirmation_visible(page):
+        return
+
     if not _sender_captcha_visible(page):
         return
 
@@ -989,6 +1066,8 @@ def _raise_sender_captcha(page: Page, stage: str) -> None:
             _progress("Captcha disappeared after instant click. Continuing sender.")
             return
 
+    if _is_booking_confirmation_visible(page):
+        return
     raise SenderCaptchaDetected(f"Captcha detected during sender ({stage}).")
 
 
@@ -2394,13 +2473,19 @@ def _select_first_available_time(
 def _wait_booking_confirmation_with_captcha_guard(page: Page, timeout_ms: int = 25_000) -> None:
     deadline = time.time() + (timeout_ms / 1000)
     while time.time() < deadline:
-        _raise_sender_captcha(page, "confirmation polling")
         try:
-            marker = page.locator("text=/scheduled|confirmed|you are scheduled/i").first
-            if marker.count() > 0 and marker.is_visible():
+            if _is_booking_confirmation_visible(page):
                 return
         except Exception:  # noqa: BLE001
             pass
+        try:
+            _raise_sender_captcha(page, "confirmation polling")
+        except SenderCaptchaDetected:
+            # Captcha marker can linger shortly after successful submission.
+            if _is_booking_confirmation_visible(page):
+                _progress("Booking confirmation detected after captcha check; continuing.")
+                return
+            raise
         _pause(page, 30)
     raise CalendlyAutomationError("Booking confirmation timeout.")
 
@@ -2425,9 +2510,17 @@ def _wait_booking_confirmation(page: Page) -> None:
         _raise_sender_captcha(page, "after schedule click")
         _wait_booking_confirmation_with_captcha_guard(page, timeout_ms=12_000)
         time.sleep(max(0, SCHEDULE_CONFIRM_EXTRA_WAIT_SECONDS))
-        _raise_sender_captcha(page, "waiting confirmation")
     except Exception as exc:  # noqa: BLE001
-        _raise_sender_captcha(page, "confirmation wait failed")
+        if _is_booking_confirmation_visible(page):
+            _progress("Booking confirmation detected despite transient wait error; continuing sender.")
+            return
+        try:
+            _raise_sender_captcha(page, "confirmation wait failed")
+        except Exception:  # noqa: BLE001
+            pass
+        if _is_booking_confirmation_visible(page):
+            _progress("Booking confirmation became visible after retry check; continuing sender.")
+            return
         raise CalendlyAutomationError("Booking confirmation was not detected.") from exc
 
 
