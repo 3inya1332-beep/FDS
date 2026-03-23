@@ -1158,17 +1158,77 @@ def _finish_email_confirmation(page: Page, confirmation_url: str, password: str)
     _safe_goto_calendly(page, confirmation_url, timeout_ms=90_000)
     _pause(page, 500)
 
-    # If sign-in page appears, fill password and continue.
-    _fill_first(
+    password_selectors = [
+        "input[type='password']",
+        "input[name='password']",
+        "input[autocomplete='current-password']",
+        "input[autocomplete='new-password']",
+    ]
+
+    # Explicitly require password input after email confirmation.
+    password_filled = _fill_first(
         page,
-        [
-            "input[type='password']",
-            "input[name='password']",
-        ],
+        password_selectors,
         password,
-        timeout=7_000,
+        timeout=10_000,
     )
-    _safe_click_next(page)
+    if not password_filled:
+        # JS fallback for stubborn password screens.
+        try:
+            password_filled = bool(
+                page.evaluate(
+                    """
+                    (value) => {
+                      const selectors = [
+                        "input[type='password']",
+                        "input[name='password']",
+                        "input[autocomplete='current-password']",
+                        "input[autocomplete='new-password']",
+                      ];
+                      for (const selector of selectors) {
+                        const el = document.querySelector(selector);
+                        if (!el) continue;
+                        const rect = el.getBoundingClientRect();
+                        const style = window.getComputedStyle(el);
+                        if (rect.width < 20 || rect.height < 10) continue;
+                        if (style.display === "none" || style.visibility === "hidden") continue;
+                        el.focus();
+                        el.value = value;
+                        el.dispatchEvent(new Event("input", { bubbles: true }));
+                        el.dispatchEvent(new Event("change", { bubbles: true }));
+                        return true;
+                      }
+                      return false;
+                    }
+                    """,
+                    password,
+                )
+            )
+        except Exception:  # noqa: BLE001
+            password_filled = False
+
+    if not password_filled:
+        raise CalendlyAutomationError("Password input not found after email confirmation.")
+
+    # Ensure typed value exists before continue.
+    try:
+        has_value = bool(
+            page.evaluate(
+                """
+                () => {
+                  const el = document.querySelector("input[type='password'], input[name='password']");
+                  return !!(el && (el.value || "").length >= 6);
+                }
+                """
+            )
+        )
+    except Exception:  # noqa: BLE001
+        has_value = True
+    if not has_value:
+        raise CalendlyAutomationError("Password value did not persist on confirmation step.")
+
+    if not _safe_click_next(page):
+        raise CalendlyAutomationError("Continue button not found after confirmation password input.")
 
 
 def _choose_random_option(page: Page, labels: list[str]) -> bool:
