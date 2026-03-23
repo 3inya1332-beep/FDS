@@ -11,14 +11,12 @@ from ads_api import AdsApiError
 from calendly_automation import (
     CalendlyAutomationError,
     NoAvailableSlotError,
-    SenderCaptchaDetected,
     ensure_input_files,
-    recreate_ads_profile_after_sender_captcha,
     register_calendly_account,
     run_booking_sender,
     run_inbox_check_sender,
 )
-from config import CALENDLY_MEETING_TYPES_URL, SENDER_CAPTCHA_MAX_RECOVERIES, SENDER_CAPTCHA_RECOVERY_ENABLED
+from config import CALENDLY_MEETING_TYPES_URL
 from profile_store import Profile, ProfileStore
 
 REGISTERED_ACCOUNTS_DIR = Path(__file__).resolve().parent / "registered-accounts"
@@ -226,40 +224,11 @@ def run_sender_flow(store: ProfileStore) -> None:
         store.update_profile(profile.local_id, booking_url=booking_url, status="ready")
 
     print("⏯️ Во время рассылки: введите 'p' + Enter для паузы, 'r' + Enter для продолжения.")
-    recovery_count = 0
-    while True:
-        try:
-            stats = run_booking_sender(
-                profile,
-                booking_url=booking_url,
-                enable_runtime_controls=True,
-            )
-            break
-        except SenderCaptchaDetected as exc:
-            if not SENDER_CAPTCHA_RECOVERY_ENABLED:
-                raise CalendlyAutomationError(f"Captcha detected and auto-recovery is disabled: {exc}") from exc
-            recovery_count += 1
-            if recovery_count > SENDER_CAPTCHA_MAX_RECOVERIES:
-                raise CalendlyAutomationError(
-                    f"Captcha detected too many times ({recovery_count}). Stop sender."
-                ) from exc
-
-            print("\n🛑 Капча обнаружена во время рассылки.")
-            print("♻️ Пересоздаем ADS профиль через API и продолжаем отправку...")
-            new_ads_profile_id = recreate_ads_profile_after_sender_captcha(
-                old_profile_id=profile.ads_profile_id,
-                profile_name=profile.name,
-            )
-            store.update_profile(
-                profile.local_id,
-                ads_profile_id=new_ads_profile_id,
-                status="captcha_recovered",
-            )
-            refreshed = store.get_profile(profile.local_id)
-            if refreshed is not None:
-                profile = refreshed
-            print(f"✅ Новый ADS профиль: {profile.ads_profile_id}")
-            print("▶️ Возобновляем рассылку на той же ссылке...\n")
+    stats = run_booking_sender(
+        profile,
+        booking_url=booking_url,
+        enable_runtime_controls=True,
+    )
 
     print("\n✅ Рассылка завершена:")
     print(f"   🗓️ Запланировано событий: {stats.scheduled_events}")

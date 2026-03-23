@@ -802,6 +802,40 @@ def _sender_captcha_visible(page: Page) -> bool:
     return False
 
 
+def _click_human_continue_modal(page: Page) -> bool:
+    # Prioritize modal/button text from screenshot: "Confirm you're human" + "Continue"
+    selectors = [
+        "button:has-text('Continue')",
+        "[role='dialog'] button:has-text('Continue')",
+        "div[role='dialog'] button:has-text('Continue')",
+        "text=/confirm you'?re human/i >> .. >> button:has-text('Continue')",
+    ]
+    if _click_first(page, selectors=selectors, timeout=250):
+        return True
+    try:
+        clicked = page.evaluate(
+            """
+            () => {
+              const dialogs = Array.from(document.querySelectorAll('[role="dialog"], div'));
+              for (const root of dialogs) {
+                const txt = (root.innerText || '').toLowerCase();
+                if (!txt.includes("confirm you're human") && !txt.includes("confirm you’re human")) continue;
+                const btn = root.querySelector('button');
+                if (!btn) continue;
+                const btxt = (btn.innerText || btn.textContent || '').trim().toLowerCase();
+                if (!btxt.includes('continue')) continue;
+                btn.click();
+                return true;
+              }
+              return false;
+            }
+            """
+        )
+        return bool(clicked)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _try_instant_sender_captcha_click(page: Page) -> bool:
     """
     Best-effort instant click on captcha checkbox/challenge entry point.
@@ -933,6 +967,15 @@ def _rotate_sender_proxy_for_recovery(proxy_port: int) -> None:
 
 def _raise_sender_captcha(page: Page, stage: str) -> None:
     if not _sender_captcha_visible(page):
+        return
+
+    # User-requested behavior: instantly click "Continue" on human-check modal.
+    if _click_human_continue_modal(page):
+        _progress(f"Human-check modal detected ({stage}), Continue clicked instantly.")
+        try:
+            page.wait_for_timeout(20)
+        except Exception:  # noqa: BLE001
+            pass
         return
 
     clicked = _try_instant_sender_captcha_click(page)
