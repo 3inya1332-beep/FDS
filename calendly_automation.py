@@ -1799,7 +1799,24 @@ def register_calendly_account(account_name: str, ads_profile_id: str) -> Registr
                     activation_id=order.activation_id,
                 )
                 _progress("Opening confirmation link")
-                _finish_email_confirmation(page, confirmation_url, password=password)
+                try:
+                    _finish_email_confirmation(page, confirmation_url, password=password)
+                except ConfirmationPasswordStepError as exc:
+                    # User request: do not restart new registration attempt when this step fails.
+                    # Persist credentials/cookies and finish current registration attempt as saved account.
+                    _progress(
+                        "Password after email confirmation was not auto-entered. "
+                        "Saving account credentials and cookies without restarting registration."
+                    )
+                    cookie_file = _save_cookies(context, account_name)
+                    return RegistrationResult(
+                        account_name=account_name,
+                        login_email=order.email,
+                        password=password,
+                        activation_id=order.activation_id,
+                        cookie_file=cookie_file,
+                        main_page_url=CALENDLY_MEETING_TYPES_URL,
+                    )
                 _progress("Completing Calendly onboarding")
                 onboarding_ok = False
                 try:
