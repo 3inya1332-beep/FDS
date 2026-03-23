@@ -10,9 +10,11 @@ import string
 import sys
 import time
 from contextlib import contextmanager
+from datetime import date, datetime, timedelta
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import requests
 
@@ -279,6 +281,13 @@ def _safe_goto_calendly(page: Page, url: str, *, timeout_ms: int = 45_000) -> No
             _progress(f"Continuing on current Calendly page: {page.url}")
             return
         raise CalendlyAutomationError(f"Failed to open page {url}: {second_exc}") from second_exc
+
+
+def _extract_date_from_booking_url(url: str) -> str | None:
+    match = re.search(r"[?&]date=(\d{4}-\d{2}-\d{2})", url)
+    if not match:
+        return None
+    return match.group(1)
 
 
 def _resolve_or_create_dir(candidates: list[Path]) -> Path:
@@ -1212,32 +1221,50 @@ def _finish_email_confirmation(page: Page, confirmation_url: str, password: str)
             password_filled = False
 
     if not password_filled:
-        _progress(
-            "Password input after confirmation not filled automatically. "
-            "Manual fallback: enter password in browser and press Enter in console."
-        )
-        try:
-            if sys.stdin.isatty():
-                input("[CONFIRM] Введите пароль вручную в браузере и нажмите Enter...")
-        except EOFError:
-            pass
-        # Re-check if password field exists and contains a value.
-        try:
-            password_filled = bool(
-                page.evaluate(
-                    """
-                    () => {
-                      const el = document.querySelector(
-                        "input[type='password'], input[name='password'], input[autocomplete='current-password']"
-                      );
-                      if (!el) return false;
-                      return (el.value || "").length >= 6;
-                    }
-                    """
+        # Retry hard without user interaction: click field and type password.
+        for _ in range(6):
+            for selector in password_selectors:
+                field = page.locator(selector).first
+                try:
+                    if field.count() == 0 or not field.is_visible():
+                        continue
+                    field.click(timeout=1_200)
+                    field.press("Control+A")
+                    field.type(password, delay=0)
+                    field.press("Tab")
+                    _pause(page, 40)
+                    password_filled = True
+                    break
+                except Exception:  # noqa: BLE001
+                    continue
+            if password_filled:
+                break
+
+            # One more JS set on each retry.
+            try:
+                password_filled = bool(
+                    page.evaluate(
+                        """
+                        (value) => {
+                          const el = document.querySelector(
+                            "input[type='password'], input[name='password'], input[autocomplete='current-password']"
+                          );
+                          if (!el) return false;
+                          el.focus();
+                          el.value = value;
+                          el.dispatchEvent(new Event("input", { bubbles: true }));
+                          el.dispatchEvent(new Event("change", { bubbles: true }));
+                          return true;
+                        }
+                        """,
+                        password,
+                    )
                 )
-            )
-        except Exception:  # noqa: BLE001
-            password_filled = False
+            except Exception:  # noqa: BLE001
+                password_filled = False
+            if password_filled:
+                break
+            _pause(page, 50)
     if not password_filled:
         raise ConfirmationPasswordStepError("Password input not found after email confirmation.")
 
@@ -1260,6 +1287,29 @@ def _finish_email_confirmation(page: Page, confirmation_url: str, password: str)
 
     if not _safe_click_next(page):
         raise ConfirmationPasswordStepError("Continue button not found after confirmation password input.")
+    _pause(page, 80)
+
+
+def _next_dated_booking_url(current_url: str) -> str | None:
+    try:
+        parsed = urlparse(current_url)
+        params = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        current_date_raw = params.get("date")
+        if not current_date_raw:
+            return None
+        current_date = datetime.strptime(current_date_raw, "%Y-%m-%d").date()
+        next_date = current_date + timedelta(days=1)
+        params["date"] = next_date.isoformat()
+        params["month"] = f"{next_date.year:04d}-{next_date.month:02d}"
+        new_query = urlencode(params)
+        return urlunparse(parsed._replace(query=new_query))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _is_date_booking_url(url: str) -> bool:
+    lower = (url or "").lower()
+    return "date=" in lower and "month=" in lower
 
 
 def _choose_random_option(page: Page, labels: list[str]) -> bool:
@@ -1776,9 +1826,22 @@ def register_calendly_account(account_name: str, ads_profile_id: str) -> Registr
                     main_page_url=CALENDLY_MEETING_TYPES_URL,
                 )
 
-        except (CaptchaSolveError, AnyMessageApiError, ProxyRotationError, PlaywrightTimeoutError) as exc:
+        except (
+            CaptchaSolveError,
+            AnyMessageApiError,
+            ProxyRotationError,
+            PlaywrightTimeoutError,
+            ConfirmationPasswordStepError,
+        ) as exc:
             last_error = exc
             _progress(f"Recoverable registration error on attempt {attempt}: {exc}")
+            # Do not roll to a new registration attempt when confirmation step failed:
+            # this account may already be created and only needs follow-up/manual login.
+            if isinstance(exc, ConfirmationPasswordStepError):
+                raise CalendlyAutomationError(
+                    f"Account confirmed but password login step failed: {exc}. "
+                    "Registration attempt was stopped to avoid creating a new account."
+                ) from exc
             if attempt < REGISTRATION_MAX_ATTEMPTS:
                 proxy_client.rotate()
                 time.sleep(2)
@@ -2226,7 +2289,12 @@ def _go_to_next_calendar_month(page: Page) -> bool:
     )
 
 
-def _select_first_available_time(page: Page, max_months_ahead: int = 6, preferred_time_offset: int = 0) -> bool:
+def _select_first_available_time(
+    page: Page,
+    max_months_ahead: int = 6,
+    preferred_time_offset: int = 0,
+    strict_date_mode: bool = False,
+) -> bool:
     """
     Open booking form by picking nearest available date/time.
     """
@@ -2234,6 +2302,12 @@ def _select_first_available_time(page: Page, max_months_ahead: int = 6, preferre
         return True
 
     _wait_booking_calendar_ready(page, timeout_seconds=12)
+
+    # Date-link mode: only pick time on current date URL, do not switch day/month via UI.
+    if strict_date_mode:
+        if _click_time_button_by_offset(page, preferred_time_offset):
+            return _is_booking_form_visible(page)
+        return _is_booking_form_visible(page)
 
     # Try current month first, then switch months.
     for month_idx in range(max_months_ahead + 1):
@@ -2500,6 +2574,8 @@ def run_booking_sender(
     target_booking_url = booking_url.strip() or (profile.booking_url or "").strip()
     if not target_booking_url:
         raise CalendlyAutomationError("Нужна ссылка booking страницы.")
+    booking_work_url = target_booking_url
+    use_date_mode = _extract_date_from_booking_url(booking_work_url) is not None
 
     scheduled = 0
     consumed = 0
@@ -2521,8 +2597,8 @@ def run_booking_sender(
             # Stage 1: prepare all tabs up to filled form.
             for idx, invitee_email in enumerate(current_batch):
                 current_page = pages[idx]
-                _progress(f"[Tab {idx + 1}/{len(pages)}] Opening booking page: {target_booking_url}")
-                _safe_goto_calendly(current_page, target_booking_url, timeout_ms=60_000)
+                _progress(f"[Tab {idx + 1}/{len(pages)}] Opening booking page: {booking_work_url}")
+                _safe_goto_calendly(current_page, booking_work_url, timeout_ms=60_000)
                 _pause(current_page, 120)
                 _dismiss_cookie_banner(current_page)
                 _raise_sender_captcha(current_page, f"tab {idx + 1} booking page opened")
@@ -2533,7 +2609,11 @@ def run_booking_sender(
                 slot_selected = False
                 for slot_attempt in range(1, 4):
                     _raise_sender_captcha(current_page, f"tab {idx + 1} slot attempt {slot_attempt} start")
-                    if _select_first_available_time(current_page, preferred_time_offset=max(0, slot_preference_offset)):
+                    if _select_first_available_time(
+                        current_page,
+                        preferred_time_offset=max(0, slot_preference_offset),
+                        strict_date_mode=use_date_mode,
+                    ):
                         slot_selected = True
                         break
                     _raise_sender_captcha(current_page, f"tab {idx + 1} slot attempt {slot_attempt} failed")
@@ -2541,6 +2621,14 @@ def run_booking_sender(
                     _pause(current_page, 200)
 
                 if not slot_selected:
+                    if use_date_mode:
+                        next_url = _next_dated_booking_url(booking_work_url)
+                        if next_url:
+                            _progress(
+                                f"[Tab {idx + 1}] No times on current date link, switching to next date URL: {next_url}"
+                            )
+                            booking_work_url = next_url
+                            continue
                     _progress(f"[Tab {idx + 1}] No available slots found now. Sender stopped without error.")
                     stop_on_slots = True
                     break
