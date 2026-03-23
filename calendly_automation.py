@@ -2412,6 +2412,9 @@ def run_booking_sender(
                     _wait_booking_confirmation(current_page)
                     successful_batch.append(invitee_email)
                     _progress(f"[Tab {idx + 1}] Booking scheduled: invitee={invitee_email}")
+                except SenderCaptchaDetected:
+                    # Must be propagated to run_sender_flow for ADS profile recreate recovery.
+                    raise
                 except Exception as exc:  # noqa: BLE001
                     failed_batch.append(invitee_email)
                     _progress(f"[Tab {idx + 1}] Booking failed for {invitee_email}: {exc}")
