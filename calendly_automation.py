@@ -4,6 +4,7 @@ import json
 import random
 import re
 import secrets
+import select
 import sqlite3
 import string
 import sys
@@ -127,6 +128,12 @@ class ManualSessionResult:
     last_url: str
 
 
+@dataclass
+class SenderRuntimeControls:
+    enabled: bool
+    paused: bool = False
+
+
 def _progress(message: str) -> None:
     print(f"[INFO] {message}", flush=True)
     _write_log(message)
@@ -135,6 +142,34 @@ def _progress(message: str) -> None:
 def _scaled_ms(milliseconds: int) -> int:
     factor = ACTION_SPEED_MULTIPLIER if ACTION_SPEED_MULTIPLIER > 0 else 1.0
     return max(int(milliseconds * factor), 1)
+
+
+def _poll_sender_runtime_controls(state: SenderRuntimeControls) -> None:
+    if not state.enabled:
+        return
+    try:
+        ready, _, _ = select.select([sys.stdin], [], [], 0)
+    except Exception:  # noqa: BLE001
+        return
+    if not ready:
+        return
+    try:
+        command = sys.stdin.readline().strip().lower()
+    except Exception:  # noqa: BLE001
+        return
+    if command in {"p", "pause"}:
+        state.paused = True
+        _progress("Sender paused. Type 'r' + Enter to resume.")
+    elif command in {"r", "resume"}:
+        state.paused = False
+        _progress("Sender resumed.")
+
+
+def _sender_runtime_checkpoint(state: SenderRuntimeControls) -> None:
+    _poll_sender_runtime_controls(state)
+    while state.paused:
+        time.sleep(0.15)
+        _poll_sender_runtime_controls(state)
 
 
 def _pause(page: Page, milliseconds: int) -> None:
@@ -2163,7 +2198,7 @@ def _wait_booking_confirmation(page: Page) -> None:
     _progress("Waiting booking confirmation.")
     try:
         _raise_sender_captcha(page, "after schedule click")
-        _wait_booking_confirmation_with_captcha_guard(page, timeout_ms=25_000)
+        _wait_booking_confirmation_with_captcha_guard(page, timeout_ms=12_000)
         time.sleep(max(0, SCHEDULE_CONFIRM_EXTRA_WAIT_SECONDS))
         _raise_sender_captcha(page, "waiting confirmation")
     except Exception as exc:  # noqa: BLE001
@@ -2358,6 +2393,7 @@ def run_booking_sender(
     persist_sent: bool = True,
     single_target_email: str | None = None,
     slot_preference_offset: int = 0,
+    enable_runtime_controls: bool = False,
 ) -> SendStats:
     ensure_input_files()
     if single_target_email:
@@ -2377,6 +2413,7 @@ def run_booking_sender(
     scheduled = 0
     consumed = 0
     used_invitee_names: set[str] = set()
+    runtime = SenderRuntimeControls(enabled=enable_runtime_controls)
 
     with open_ads_page(profile.ads_profile_id) as (page, context):
         _load_cookies_if_present(context, profile.cookie_file)
@@ -2384,6 +2421,7 @@ def run_booking_sender(
         _progress("Sender mode: single tab.")
 
         while email_pool:
+            _sender_runtime_checkpoint(runtime)
             active_count = 1
             current_batch = email_pool[:active_count]
             ready_jobs: list[tuple[int, Page, str]] = []
@@ -2432,6 +2470,7 @@ def run_booking_sender(
                 break
 
             # Stage 2: submit in current tab.
+            _sender_runtime_checkpoint(runtime)
             _progress("Submitting booking in current tab.")
             submitted_jobs: list[tuple[int, Page, str]] = []
             for idx, current_page, invitee_email in ready_jobs:
@@ -2466,6 +2505,7 @@ def run_booking_sender(
 
             consumed += len(successful_batch)
             scheduled += len(successful_batch)
+            _progress(f"📊 Прогресс рассылки: {scheduled}/{total_input} отправлено")
             if not successful_batch and failed_batch:
                 _progress("No successful bookings in this wave; stopping to avoid endless retry loop.")
                 break

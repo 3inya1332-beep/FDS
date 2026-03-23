@@ -5,7 +5,6 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Iterable
 
 from ads_api import AdsApiError
@@ -14,20 +13,12 @@ from calendly_automation import (
     NoAvailableSlotError,
     SenderCaptchaDetected,
     ensure_input_files,
-    load_unsent_email_pool,
-    mark_emails_as_sent,
-    remove_emails_from_pool,
     recreate_ads_profile_after_sender_captcha,
     register_calendly_account,
     run_booking_sender,
     run_inbox_check_sender,
 )
-from config import (
-    CALENDLY_MEETING_TYPES_URL,
-    SENDER_CAPTCHA_MAX_RECOVERIES,
-    SENDER_CAPTCHA_RECOVERY_ENABLED,
-    SENDER_MULTI_PROFILE_PROXY_PORTS,
-)
+from config import CALENDLY_MEETING_TYPES_URL, SENDER_CAPTCHA_MAX_RECOVERIES, SENDER_CAPTCHA_RECOVERY_ENABLED
 from profile_store import Profile, ProfileStore
 
 REGISTERED_ACCOUNTS_DIR = Path(__file__).resolve().parent / "registered-accounts"
@@ -220,11 +211,6 @@ def setup_account_flow(store: ProfileStore) -> None:
 
 def run_sender_flow(store: ProfileStore) -> None:
     print("\n📨 Начинаем рассылку бронирований")
-    mode = input("Режим: [1] один профиль (Enter) / [5] пять профилей: ").strip()
-    if mode == "5":
-        run_sender_5_profiles_flow(store)
-        return
-
     profile = select_profile_flow(store)
     if profile is None:
         return
@@ -239,12 +225,14 @@ def run_sender_flow(store: ProfileStore) -> None:
     if not profile.booking_url:
         store.update_profile(profile.local_id, booking_url=booking_url, status="ready")
 
+    print("⏯️ Во время рассылки: введите 'p' + Enter для паузы, 'r' + Enter для продолжения.")
     recovery_count = 0
     while True:
         try:
             stats = run_booking_sender(
                 profile,
                 booking_url=booking_url,
+                enable_runtime_controls=True,
             )
             break
         except SenderCaptchaDetected as exc:
@@ -277,182 +265,6 @@ def run_sender_flow(store: ProfileStore) -> None:
     print(f"   🗓️ Запланировано событий: {stats.scheduled_events}")
     print(f"   📬 Израсходовано email: {stats.consumed_emails}")
     print(f"   📂 Осталось email: {stats.remaining_emails}")
-
-
-def _select_multiple_profiles(store: ProfileStore, required_count: int) -> list[Profile]:
-    profiles = list(store.list_profiles())
-    print_profiles(profiles)
-    if len(profiles) < required_count:
-        print(f"⚠️ Нужно минимум {required_count} профилей. Сейчас: {len(profiles)}.")
-        return []
-
-    raw = input(
-        f"Введите {required_count} локальных ID через запятую (Enter = взять первые {required_count}): "
-    ).strip()
-    selected_profiles: list[Profile] = []
-    if not raw:
-        return profiles[:required_count]
-
-    parts = [part.strip() for part in re.split(r"[,\s]+", raw) if part.strip()]
-    ids: list[int] = []
-    for part in parts:
-        if not part.isdigit():
-            print(f"⚠️ Некорректный ID: {part}")
-            return []
-        value = int(part)
-        if value in ids:
-            continue
-        ids.append(value)
-
-    if len(ids) != required_count:
-        print(f"⚠️ Нужно выбрать ровно {required_count} уникальных профилей.")
-        return []
-
-    for local_id in ids:
-        profile = store.get_profile(local_id)
-        if profile is None:
-            print(f"⚠️ Профиль с ID {local_id} не найден.")
-            return []
-        selected_profiles.append(profile)
-    return selected_profiles
-
-
-def run_sender_5_profiles_flow(store: ProfileStore) -> None:
-    print("\n📨 Мульти-рассылка через 5 ADS профилей")
-    profiles = _select_multiple_profiles(store, required_count=5)
-    if not profiles:
-        return
-    if len(SENDER_MULTI_PROFILE_PROXY_PORTS) < 5:
-        print("⚠️ В config.py нужно минимум 5 прокси-портов в SENDER_MULTI_PROFILE_PROXY_PORTS.")
-        return
-
-    shared_booking_url = input(
-        "🔗 Общая booking ссылка для всех 5 профилей (Enter = использовать сохраненную у каждого): "
-    ).strip()
-
-    profile_booking_urls: dict[int, str] = {}
-    for profile in profiles:
-        booking_url = shared_booking_url or profile.booking_url
-        if not booking_url:
-            print(
-                f"⚠️ У профиля {profile.local_id} нет booking ссылки. "
-                "Укажите общую ссылку или заполните ссылку у профиля."
-            )
-            return
-        profile_booking_urls[profile.local_id] = booking_url
-        if shared_booking_url and not profile.booking_url:
-            store.update_profile(profile.local_id, booking_url=shared_booking_url, status="ready")
-
-    email_queue = load_unsent_email_pool()
-    if not email_queue:
-        print("⚠️ Нет доступных email для отправки (пусто или уже отправлены).")
-        return
-
-    total_input = len(email_queue)
-    total_sent = 0
-    profile_proxy_ports: dict[int, int] = {
-        profiles[idx].local_id: int(SENDER_MULTI_PROFILE_PROXY_PORTS[idx]) for idx in range(len(profiles))
-    }
-    print("🌐 Порты прокси для recovery по профилям:")
-    for profile in profiles:
-        print(f"   Профиль {profile.local_id} -> {profile_proxy_ports[profile.local_id]}")
-
-    def send_one_email_with_recovery(
-        profile: Profile,
-        *,
-        invitee_email: str,
-        booking_url: str,
-        slot_offset: int,
-        proxy_port: int,
-    ) -> tuple[bool, str, Profile]:
-        current_profile = profile
-        recovery_count = 0
-        while True:
-            try:
-                stats = run_booking_sender(
-                    current_profile,
-                    booking_url=booking_url,
-                    persist_sent=False,
-                    single_target_email=invitee_email,
-                    slot_preference_offset=slot_offset,
-                )
-                return (stats.scheduled_events > 0, invitee_email, current_profile)
-            except SenderCaptchaDetected as exc:
-                if not SENDER_CAPTCHA_RECOVERY_ENABLED:
-                    raise CalendlyAutomationError(
-                        f"Captcha detected and auto-recovery is disabled: {exc}"
-                    ) from exc
-                recovery_count += 1
-                if recovery_count > SENDER_CAPTCHA_MAX_RECOVERIES:
-                    raise CalendlyAutomationError(
-                        f"Captcha detected too many times ({recovery_count}) for profile {current_profile.local_id}."
-                    ) from exc
-
-                print(
-                    f"\n🛑 Капча на профиле {current_profile.local_id}. "
-                    f"Прокси-порт: {proxy_port}. Пересоздаем ADS профиль..."
-                )
-                new_ads_profile_id = recreate_ads_profile_after_sender_captcha(
-                    old_profile_id=current_profile.ads_profile_id,
-                    profile_name=current_profile.name,
-                    proxy_port=proxy_port,
-                )
-                store.update_profile(
-                    current_profile.local_id,
-                    ads_profile_id=new_ads_profile_id,
-                    status="captcha_recovered",
-                )
-                refreshed = store.get_profile(current_profile.local_id)
-                if refreshed is not None:
-                    current_profile = refreshed
-                print(f"✅ Новый ADS профиль для {current_profile.local_id}: {current_profile.ads_profile_id}")
-
-    while email_queue:
-        batch_size = min(len(profiles), len(email_queue))
-        batch_emails = email_queue[:batch_size]
-        successful_batch: list[str] = []
-
-        # One wave = up to 5 profiles launched simultaneously.
-        with ThreadPoolExecutor(max_workers=batch_size) as executor:
-            future_map = {}
-            for idx in range(batch_size):
-                profile = profiles[idx]
-                invitee_email = batch_emails[idx]
-                booking_url = profile_booking_urls[profile.local_id]
-                proxy_port = profile_proxy_ports[profile.local_id]
-                future = executor.submit(
-                    send_one_email_with_recovery,
-                    profile,
-                    invitee_email=invitee_email,
-                    booking_url=booking_url,
-                    slot_offset=idx,
-                    proxy_port=proxy_port,
-                )
-                future_map[future] = (idx, profile.local_id, invitee_email)
-
-            for future in as_completed(future_map):
-                idx, _local_id, _invitee_email = future_map[future]
-                ok, email, updated_profile = future.result()
-                profiles[idx] = updated_profile
-                if ok:
-                    successful_batch.append(email)
-                    total_sent += 1
-
-        successful_set = {email.lower() for email in successful_batch}
-        failed_batch = [email for email in batch_emails if email.lower() not in successful_set]
-        email_queue = failed_batch + email_queue[batch_size:]
-
-        if successful_batch:
-            mark_emails_as_sent(successful_batch)
-            remove_emails_from_pool(successful_batch)
-
-        if not successful_batch:
-            print("⚠️ В этой волне нет успешных отправок. Останавливаем мульти-режим.")
-            break
-
-    print("\n✅ Мульти-рассылка (5 профилей) завершена:")
-    print(f"   📬 Отправлено: {total_sent}")
-    print(f"   📂 Осталось email: {len(email_queue)} из {total_input}")
 
 
 def run_inbox_check_flow(store: ProfileStore) -> None:
@@ -501,7 +313,7 @@ def show_menu() -> None:
         print("2. ➕ Добавить профиль ADS вручную")
         print("3. 🔗 Добавить/обновить ссылки профиля")
         print("4. ⛔ Настройка аккаунта (временно недоступно)")
-        print("5. 📨 Начать рассылку (1 профиль / 5 профилей)")
+        print("5. 📨 Начать рассылку (быстрый single-profile)")
         print("6. 📮 Проверка инбокса (тестовая отправка)")
         print("7. 📚 Показать профили")
         print("8. 🗑️ Удалить профиль")
