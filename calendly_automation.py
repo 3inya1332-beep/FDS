@@ -466,6 +466,11 @@ def load_unsent_email_pool() -> list[str]:
     return _filter_unsent_emails(load_email_pool())
 
 
+def mark_emails_as_sent(emails: Iterable[str]) -> None:
+    _append_sent_emails_file(emails)
+    _save_sent_emails_db(emails)
+
+
 def remove_emails_from_pool(emails_to_remove: Iterable[str]) -> None:
     removal = {email.strip().lower() for email in emails_to_remove if email.strip()}
     if not removal:
@@ -813,8 +818,8 @@ def _parse_screen_resolution(value: str) -> tuple[int, int]:
     return width, height
 
 
-def _measure_sender_proxy_latency_ms() -> float | None:
-    proxy_uri = f"socks5h://{SENDER_CAPTCHA_PROXY_HOST}:{SENDER_CAPTCHA_PROXY_PORT}"
+def _measure_sender_proxy_latency_ms(proxy_port: int) -> float | None:
+    proxy_uri = f"socks5h://{SENDER_CAPTCHA_PROXY_HOST}:{int(proxy_port)}"
     start = time.perf_counter()
     try:
         response = requests.get(
@@ -830,16 +835,16 @@ def _measure_sender_proxy_latency_ms() -> float | None:
         return None
 
 
-def _rotate_sender_proxy_for_recovery() -> None:
+def _rotate_sender_proxy_for_recovery(proxy_port: int) -> None:
     url = (SENDER_CAPTCHA_PROXY_ROTATE_URL or "").strip()
     if not url:
         return
     rotate_url = url
     if "port=" not in rotate_url.lower():
         separator = "&" if "?" in rotate_url else "?"
-        rotate_url = f"{rotate_url}{separator}port={SENDER_CAPTCHA_PROXY_PORT}"
+        rotate_url = f"{rotate_url}{separator}port={int(proxy_port)}"
     _progress(
-        f"Sender captcha recovery: rotating proxy via API (same profile port {SENDER_CAPTCHA_PROXY_PORT})."
+        f"Sender captcha recovery: rotating proxy via API (same profile port {int(proxy_port)})."
     )
     attempts = max(1, int(SENDER_CAPTCHA_PROXY_ROTATE_ATTEMPTS))
     acceptable_ms = max(150, int(SENDER_CAPTCHA_PROXY_ACCEPTABLE_PING_MS))
@@ -857,7 +862,7 @@ def _rotate_sender_proxy_for_recovery() -> None:
             _progress(f"Proxy rotate API warning ({attempt}/{attempts}): {exc}")
             continue
 
-        latency_ms = _measure_sender_proxy_latency_ms()
+        latency_ms = _measure_sender_proxy_latency_ms(proxy_port)
         if latency_ms is None:
             _progress("Proxy latency test failed; using this rotated proxy without extra rotations.")
             return
@@ -1696,7 +1701,12 @@ def run_manual_ads_session(
         return ManualSessionResult(cookie_file=cookie_file, last_url=current_url)
 
 
-def recreate_ads_profile_after_sender_captcha(*, old_profile_id: str, profile_name: str) -> str:
+def recreate_ads_profile_after_sender_captcha(
+    *,
+    old_profile_id: str,
+    profile_name: str,
+    proxy_port: int | None = None,
+) -> str:
     proxy_type = (SENDER_CAPTCHA_PROXY_TYPE or "").strip().lower()
     if proxy_type != "socks5":
         raise CalendlyAutomationError("Only socks5 proxy type is supported for sender captcha recovery.")
@@ -1714,7 +1724,9 @@ def recreate_ads_profile_after_sender_captcha(*, old_profile_id: str, profile_na
     except Exception as exc:  # noqa: BLE001
         _progress(f"Old ADS profile delete warning: {exc}")
 
-    _rotate_sender_proxy_for_recovery()
+    effective_proxy_port = int(proxy_port) if proxy_port is not None else int(SENDER_CAPTCHA_PROXY_PORT)
+
+    _rotate_sender_proxy_for_recovery(effective_proxy_port)
 
     new_profile_name = (
         f"{SENDER_CAPTCHA_PROFILE_NAME_PREFIX}-{_slugify(profile_name)}-{int(time.time())}"
@@ -1723,7 +1735,7 @@ def recreate_ads_profile_after_sender_captcha(*, old_profile_id: str, profile_na
     new_profile_id = ads_client.create_profile_with_socks5(
         profile_name=new_profile_name,
         proxy_host=SENDER_CAPTCHA_PROXY_HOST,
-        proxy_port=int(SENDER_CAPTCHA_PROXY_PORT),
+        proxy_port=effective_proxy_port,
         proxy_user=SENDER_CAPTCHA_PROXY_USER,
         proxy_password=SENDER_CAPTCHA_PROXY_PASSWORD,
         desktop_screen_width=screen_width,
