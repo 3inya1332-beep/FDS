@@ -104,6 +104,10 @@ class NoAvailableSlotError(CalendlyAutomationError):
     pass
 
 
+class ConfirmationPasswordStepError(CalendlyAutomationError):
+    pass
+
+
 @dataclass
 class RegistrationResult:
     account_name: str
@@ -1208,7 +1212,34 @@ def _finish_email_confirmation(page: Page, confirmation_url: str, password: str)
             password_filled = False
 
     if not password_filled:
-        raise CalendlyAutomationError("Password input not found after email confirmation.")
+        _progress(
+            "Password input after confirmation not filled automatically. "
+            "Manual fallback: enter password in browser and press Enter in console."
+        )
+        try:
+            if sys.stdin.isatty():
+                input("[CONFIRM] Введите пароль вручную в браузере и нажмите Enter...")
+        except EOFError:
+            pass
+        # Re-check if password field exists and contains a value.
+        try:
+            password_filled = bool(
+                page.evaluate(
+                    """
+                    () => {
+                      const el = document.querySelector(
+                        "input[type='password'], input[name='password'], input[autocomplete='current-password']"
+                      );
+                      if (!el) return false;
+                      return (el.value || "").length >= 6;
+                    }
+                    """
+                )
+            )
+        except Exception:  # noqa: BLE001
+            password_filled = False
+    if not password_filled:
+        raise ConfirmationPasswordStepError("Password input not found after email confirmation.")
 
     # Ensure typed value exists before continue.
     try:
@@ -1225,10 +1256,10 @@ def _finish_email_confirmation(page: Page, confirmation_url: str, password: str)
     except Exception:  # noqa: BLE001
         has_value = True
     if not has_value:
-        raise CalendlyAutomationError("Password value did not persist on confirmation step.")
+        raise ConfirmationPasswordStepError("Password value did not persist on confirmation step.")
 
     if not _safe_click_next(page):
-        raise CalendlyAutomationError("Continue button not found after confirmation password input.")
+        raise ConfirmationPasswordStepError("Continue button not found after confirmation password input.")
 
 
 def _choose_random_option(page: Page, labels: list[str]) -> bool:
