@@ -73,7 +73,6 @@ from config import (
     SENDER_CAPTCHA_PROXY_ROTATE_URL,
     SENDER_CAPTCHA_PROXY_TYPE,
     SENDER_CAPTCHA_PROXY_USER,
-    SENDER_PARALLEL_TABS,
     SENT_EMAILS_DIR,
     SENT_EMAILS_FILENAME,
     SIGNUP_INITIAL_DELAY_SECONDS,
@@ -2344,20 +2343,14 @@ def run_booking_sender(
     scheduled = 0
     consumed = 0
     used_invitee_names: set[str] = set()
-    parallel_tabs = 1 if single_target_email else max(1, int(SENDER_PARALLEL_TABS))
 
     with open_ads_page(profile.ads_profile_id) as (page, context):
         _load_cookies_if_present(context, profile.cookie_file)
         pages: list[Page] = [page]
-        for _ in range(max(0, parallel_tabs - 1)):
-            worker_page = context.new_page()
-            worker_page.set_default_timeout(8_000)
-            worker_page.set_default_navigation_timeout(45_000)
-            pages.append(worker_page)
-        _progress(f"Sender parallel tabs enabled: {len(pages)}")
+        _progress("Sender mode: single tab.")
 
         while email_pool:
-            active_count = min(len(pages), len(email_pool))
+            active_count = 1
             current_batch = email_pool[:active_count]
             ready_jobs: list[tuple[int, Page, str]] = []
             stop_on_slots = False
@@ -2404,8 +2397,8 @@ def run_booking_sender(
             if not ready_jobs:
                 break
 
-            # Stage 2: fast submit wave across all ready tabs.
-            _progress(f"Submitting batch in parallel wave: {len(ready_jobs)} tabs.")
+            # Stage 2: submit in current tab.
+            _progress("Submitting booking in current tab.")
             submitted_jobs: list[tuple[int, Page, str]] = []
             for idx, current_page, invitee_email in ready_jobs:
                 _submit_booking_form(current_page)
