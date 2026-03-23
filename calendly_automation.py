@@ -462,6 +462,19 @@ def load_email_pool() -> list[str]:
     return unique
 
 
+def load_unsent_email_pool() -> list[str]:
+    return _filter_unsent_emails(load_email_pool())
+
+
+def remove_emails_from_pool(emails_to_remove: Iterable[str]) -> None:
+    removal = {email.strip().lower() for email in emails_to_remove if email.strip()}
+    if not removal:
+        return
+    current = load_email_pool()
+    remaining = [email for email in current if email.strip().lower() not in removal]
+    save_email_pool(remaining)
+
+
 def save_email_pool(emails: Iterable[str]) -> None:
     file_path = _get_email_file()
     content = "\n".join(emails).strip()
@@ -1959,14 +1972,19 @@ def _wait_booking_calendar_ready(page: Page, timeout_seconds: int = 12) -> None:
 
 
 def _click_first_time_button(page: Page) -> bool:
+    return _click_time_button_by_offset(page, 0)
+
+
+def _click_time_button_by_offset(page: Page, offset: int) -> bool:
     visible_before = _count_visible_time_buttons(page)
     _progress(f"Visible time buttons: {visible_before}")
     try:
         clicked = page.evaluate(
             """
-            () => {
+            (slotOffset) => {
               const buttons = Array.from(document.querySelectorAll('button'));
               const regex = /^\\d{1,2}:\\d{2}\\s?(am|pm)$/i;
+              const matched = [];
               for (const btn of buttons) {
                 const txt = (btn.textContent || '').trim();
                 if (!regex.test(txt)) continue;
@@ -1975,12 +1993,15 @@ def _click_first_time_button(page: Page) -> bool:
                 const s = window.getComputedStyle(btn);
                 if (r.width < 40 || r.height < 20) continue;
                 if (s.display === 'none' || s.visibility === 'hidden') continue;
-                btn.click();
-                return true;
+                matched.push(btn);
               }
-              return false;
+              if (!matched.length) return false;
+              const idx = Math.min(Math.max(Number(slotOffset) || 0, 0), matched.length - 1);
+              matched[idx].click();
+              return true;
             }
-            """
+            """,
+            int(max(0, offset)),
         )
         if clicked:
             _pause(page, 100)
@@ -2067,7 +2088,7 @@ def _go_to_next_calendar_month(page: Page) -> bool:
     )
 
 
-def _select_first_available_time(page: Page, max_months_ahead: int = 6) -> bool:
+def _select_first_available_time(page: Page, max_months_ahead: int = 6, preferred_time_offset: int = 0) -> bool:
     """
     Open booking form by picking nearest available date/time.
     """
@@ -2079,13 +2100,13 @@ def _select_first_available_time(page: Page, max_months_ahead: int = 6) -> bool:
     # Try current month first, then switch months.
     for month_idx in range(max_months_ahead + 1):
         _raise_sender_captcha(page, f"month scan {month_idx}")
-        if _click_first_time_button(page):
+        if _click_time_button_by_offset(page, preferred_time_offset):
             if _is_booking_form_visible(page):
                 return True
 
         # If times are hidden until date chosen, pick date and retry time.
         if _click_first_available_date(page):
-            if _click_first_time_button(page):
+            if _click_time_button_by_offset(page, preferred_time_offset):
                 if _is_booking_form_visible(page):
                     return True
 
@@ -2324,6 +2345,7 @@ def run_booking_sender(
     booking_url: str,
     persist_sent: bool = True,
     single_target_email: str | None = None,
+    slot_preference_offset: int = 0,
 ) -> SendStats:
     ensure_input_files()
     if single_target_email:
@@ -2370,7 +2392,7 @@ def run_booking_sender(
                 slot_selected = False
                 for slot_attempt in range(1, 4):
                     _raise_sender_captcha(current_page, f"tab {idx + 1} slot attempt {slot_attempt} start")
-                    if _select_first_available_time(current_page):
+                    if _select_first_available_time(current_page, preferred_time_offset=max(0, slot_preference_offset)):
                         slot_selected = True
                         break
                     _raise_sender_captcha(current_page, f"tab {idx + 1} slot attempt {slot_attempt} failed")
