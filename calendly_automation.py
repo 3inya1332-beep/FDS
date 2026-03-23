@@ -140,6 +140,10 @@ class SenderRuntimeControls:
     paused: bool = False
 
 
+_SENDER_CAPTCHA_CLICK_STATE: dict[int, float] = {}
+_SENDER_CAPTCHA_SINGLE_TRY_WAIT_SECONDS = 10.0
+
+
 def _progress(message: str) -> None:
     print(f"[INFO] {message}", flush=True)
     _write_log(message)
@@ -802,6 +806,14 @@ def _sender_captcha_visible(page: Page) -> bool:
     return False
 
 
+def _sender_page_key(page: Page) -> int:
+    return id(page)
+
+
+def _clear_sender_captcha_state(page: Page) -> None:
+    _SENDER_CAPTCHA_CLICK_STATE.pop(_sender_page_key(page), None)
+
+
 def _is_booking_confirmation_visible(page: Page) -> bool:
     current_url = (page.url or "").lower()
     success_url_parts = [
@@ -1041,14 +1053,32 @@ def _rotate_sender_proxy_for_recovery(proxy_port: int) -> None:
 def _raise_sender_captcha(page: Page, stage: str) -> None:
     # If booking is already confirmed, captcha checks should not interrupt sender flow.
     if _is_booking_confirmation_visible(page):
+        _clear_sender_captcha_state(page)
         return
 
     if not _sender_captcha_visible(page):
+        _clear_sender_captcha_state(page)
+        return
+
+    page_key = _sender_page_key(page)
+    first_click_ts = _SENDER_CAPTCHA_CLICK_STATE.get(page_key)
+    if first_click_ts is not None:
+        waited = time.time() - first_click_ts
+        if waited >= _SENDER_CAPTCHA_SINGLE_TRY_WAIT_SECONDS:
+            _clear_sender_captcha_state(page)
+            raise SenderCaptchaDetected(
+                f"Captcha still active {waited:.1f}s after one click ({stage}); skip current email."
+            )
         return
 
     # User-requested behavior: instantly click "Continue" on human-check modal.
     if _click_human_continue_modal(page):
-        _progress(f"Human-check modal detected ({stage}), Continue clicked instantly.")
+        _SENDER_CAPTCHA_CLICK_STATE[page_key] = time.time()
+        _progress(
+            "Human-check modal detected "
+            f"({stage}), Continue clicked once. Waiting up to "
+            f"{int(_SENDER_CAPTCHA_SINGLE_TRY_WAIT_SECONDS)}s."
+        )
         try:
             page.wait_for_timeout(20)
         except Exception:  # noqa: BLE001
@@ -1057,16 +1087,23 @@ def _raise_sender_captcha(page: Page, stage: str) -> None:
 
     clicked = _try_instant_sender_captcha_click(page)
     if clicked:
-        _progress(f"Sender captcha detected ({stage}), instant one-click sent.")
+        _SENDER_CAPTCHA_CLICK_STATE[page_key] = time.time()
+        _progress(
+            f"Sender captcha detected ({stage}), one instant click sent. "
+            f"Waiting up to {int(_SENDER_CAPTCHA_SINGLE_TRY_WAIT_SECONDS)}s."
+        )
         try:
             page.wait_for_timeout(25)
         except Exception:  # noqa: BLE001
             pass
         if not _sender_captcha_visible(page):
+            _clear_sender_captcha_state(page)
             _progress("Captcha disappeared after instant click. Continuing sender.")
             return
+        return
 
     if _is_booking_confirmation_visible(page):
+        _clear_sender_captcha_state(page)
         return
     raise SenderCaptchaDetected(f"Captcha detected during sender ({stage}).")
 
@@ -2506,16 +2543,21 @@ def _submit_booking_form(page: Page) -> None:
 
 def _wait_booking_confirmation(page: Page) -> None:
     _progress("Waiting booking confirmation.")
+    timeout_ms = int(_SENDER_CAPTCHA_SINGLE_TRY_WAIT_SECONDS * 1000)
     try:
         _raise_sender_captcha(page, "after schedule click")
-        _wait_booking_confirmation_with_captcha_guard(page, timeout_ms=12_000)
+        _wait_booking_confirmation_with_captcha_guard(page, timeout_ms=max(4_000, timeout_ms))
         time.sleep(max(0, SCHEDULE_CONFIRM_EXTRA_WAIT_SECONDS))
+    except SenderCaptchaDetected:
+        raise
     except Exception as exc:  # noqa: BLE001
         if _is_booking_confirmation_visible(page):
             _progress("Booking confirmation detected despite transient wait error; continuing sender.")
             return
         try:
             _raise_sender_captcha(page, "confirmation wait failed")
+        except SenderCaptchaDetected:
+            raise
         except Exception:  # noqa: BLE001
             pass
         if _is_booking_confirmation_visible(page):
@@ -2735,7 +2777,7 @@ def run_booking_sender(
     used_invitee_names: set[str] = set()
     runtime = SenderRuntimeControls(enabled=enable_runtime_controls)
 
-    with open_ads_page(profile.ads_profile_id) as (page, context):
+    with open_ads_page(profile.ads_profile_id, stop_profile_on_exit=False) as (page, context):
         _load_cookies_if_present(context, profile.cookie_file)
         pages: list[Page] = [page]
         _progress("Sender mode: single tab.")
@@ -2746,82 +2788,109 @@ def run_booking_sender(
             current_batch = email_pool[:active_count]
             ready_jobs: list[tuple[int, Page, str]] = []
             stop_on_slots = False
+            failed_batch: list[str] = []
 
             # Stage 1: prepare all tabs up to filled form.
             for idx, invitee_email in enumerate(current_batch):
                 current_page = pages[idx]
-                _progress(f"[Tab {idx + 1}/{len(pages)}] Opening booking page: {booking_work_url}")
-                _safe_goto_calendly(current_page, booking_work_url, timeout_ms=60_000)
-                _pause(current_page, 120)
-                _dismiss_cookie_banner(current_page)
-                _raise_sender_captcha(current_page, f"tab {idx + 1} booking page opened")
-                _wait_booking_calendar_ready(current_page, timeout_seconds=12)
-                _raise_sender_captcha(current_page, f"tab {idx + 1} calendar ready")
+                try:
+                    _progress(f"[Tab {idx + 1}/{len(pages)}] Opening booking page: {booking_work_url}")
+                    _safe_goto_calendly(current_page, booking_work_url, timeout_ms=60_000)
+                    _pause(current_page, 120)
+                    _dismiss_cookie_banner(current_page)
+                    _raise_sender_captcha(current_page, f"tab {idx + 1} booking page opened")
+                    _wait_booking_calendar_ready(current_page, timeout_seconds=12)
+                    _raise_sender_captcha(current_page, f"tab {idx + 1} calendar ready")
 
-                _progress(f"[Tab {idx + 1}] Selecting first available date and time.")
-                slot_selected = False
-                for slot_attempt in range(1, 4):
-                    _raise_sender_captcha(current_page, f"tab {idx + 1} slot attempt {slot_attempt} start")
-                    if _select_first_available_time(
-                        current_page,
-                        preferred_time_offset=max(0, slot_preference_offset),
-                        strict_date_mode=use_date_mode,
-                    ):
-                        slot_selected = True
+                    _progress(f"[Tab {idx + 1}] Selecting first available date and time.")
+                    slot_selected = False
+                    for slot_attempt in range(1, 4):
+                        _raise_sender_captcha(current_page, f"tab {idx + 1} slot attempt {slot_attempt} start")
+                        if _select_first_available_time(
+                            current_page,
+                            preferred_time_offset=max(0, slot_preference_offset),
+                            strict_date_mode=use_date_mode,
+                        ):
+                            slot_selected = True
+                            break
+                        _raise_sender_captcha(current_page, f"tab {idx + 1} slot attempt {slot_attempt} failed")
+                        _progress(f"[Tab {idx + 1}] Slot attempt {slot_attempt}/3 failed.")
+                        _pause(current_page, 200)
+
+                    if not slot_selected:
+                        if use_date_mode:
+                            next_url = _next_dated_booking_url(booking_work_url)
+                            if next_url:
+                                _progress(
+                                    f"[Tab {idx + 1}] No times on current date link, switching to next date URL: {next_url}"
+                                )
+                                booking_work_url = next_url
+                                continue
+                        _progress(f"[Tab {idx + 1}] No available slots found now. Sender stopped without error.")
+                        stop_on_slots = True
                         break
-                    _raise_sender_captcha(current_page, f"tab {idx + 1} slot attempt {slot_attempt} failed")
-                    _progress(f"[Tab {idx + 1}] Slot attempt {slot_attempt}/3 failed.")
-                    _pause(current_page, 200)
 
-                if not slot_selected:
-                    if use_date_mode:
-                        next_url = _next_dated_booking_url(booking_work_url)
-                        if next_url:
-                            _progress(
-                                f"[Tab {idx + 1}] No times on current date link, switching to next date URL: {next_url}"
-                            )
-                            booking_work_url = next_url
-                            continue
-                    _progress(f"[Tab {idx + 1}] No available slots found now. Sender stopped without error.")
-                    stop_on_slots = True
-                    break
-
-                invitee_name = _generate_real_invitee_name(used_invitee_names)
-                _fill_booking_form(
-                    current_page,
-                    invitee_name=invitee_name,
-                    invitee_email=invitee_email,
-                    guest_emails=[],
-                    submit_and_wait=False,
-                )
-                ready_jobs.append((idx, current_page, invitee_email))
+                    invitee_name = _generate_real_invitee_name(used_invitee_names)
+                    _fill_booking_form(
+                        current_page,
+                        invitee_name=invitee_name,
+                        invitee_email=invitee_email,
+                        guest_emails=[],
+                        submit_and_wait=False,
+                    )
+                    ready_jobs.append((idx, current_page, invitee_email))
+                except SenderCaptchaDetected as exc:
+                    failed_batch.append(invitee_email)
+                    _clear_sender_captcha_state(current_page)
+                    _progress(f"[Tab {idx + 1}] Captcha unresolved for {invitee_email}; skipping email: {exc}")
+                    continue
+                except Exception as exc:  # noqa: BLE001
+                    failed_batch.append(invitee_email)
+                    _clear_sender_captcha_state(current_page)
+                    _progress(f"[Tab {idx + 1}] Prepare failed for {invitee_email}; skipping email: {exc}")
+                    continue
 
             if stop_on_slots:
                 break
             if not ready_jobs:
-                break
+                # Skip failed batch and continue with next emails without stopping sender.
+                failed_set = {email.lower() for email in failed_batch}
+                email_pool = [email for email in current_batch if email.lower() not in failed_set] + email_pool[active_count:]
+                if not single_target_email:
+                    save_email_pool(email_pool)
+                continue
 
             # Stage 2: submit in current tab.
             _sender_runtime_checkpoint(runtime)
             _progress("Submitting booking in current tab.")
             submitted_jobs: list[tuple[int, Page, str]] = []
             for idx, current_page, invitee_email in ready_jobs:
-                _submit_booking_form(current_page)
-                submitted_jobs.append((idx, current_page, invitee_email))
+                try:
+                    _submit_booking_form(current_page)
+                    submitted_jobs.append((idx, current_page, invitee_email))
+                except SenderCaptchaDetected as exc:
+                    failed_batch.append(invitee_email)
+                    _clear_sender_captcha_state(current_page)
+                    _progress(f"[Tab {idx + 1}] Captcha unresolved at submit for {invitee_email}; skipping: {exc}")
+                except Exception as exc:  # noqa: BLE001
+                    failed_batch.append(invitee_email)
+                    _clear_sender_captcha_state(current_page)
+                    _progress(f"[Tab {idx + 1}] Submit failed for {invitee_email}; skipping: {exc}")
 
             # Stage 3: wait confirmations for all submitted tabs.
             successful_batch: list[str] = []
-            failed_batch: list[str] = []
             for idx, current_page, invitee_email in submitted_jobs:
                 try:
                     _wait_booking_confirmation(current_page)
                     successful_batch.append(invitee_email)
                     _progress(f"[Tab {idx + 1}] Booking scheduled: invitee={invitee_email}")
-                except SenderCaptchaDetected:
-                    # Must be propagated to run_sender_flow for ADS profile recreate recovery.
-                    raise
+                except SenderCaptchaDetected as exc:
+                    failed_batch.append(invitee_email)
+                    _clear_sender_captcha_state(current_page)
+                    _progress(f"[Tab {idx + 1}] Captcha unresolved for {invitee_email}; skipping email: {exc}")
                 except Exception as exc:  # noqa: BLE001
                     failed_batch.append(invitee_email)
+                    _clear_sender_captcha_state(current_page)
                     _progress(f"[Tab {idx + 1}] Booking failed for {invitee_email}: {exc}")
 
             if successful_batch and persist_sent:
@@ -2829,8 +2898,17 @@ def run_booking_sender(
                 _save_sent_emails_db(successful_batch)
 
             # Keep failed emails for retry, remove only successful from current batch.
+            # But captcha-timeout failures should be skipped immediately (no endless retries).
             success_set = {email.lower() for email in successful_batch}
-            retriable_failed = [email for email in current_batch if email.lower() not in success_set]
+            failed_set = {email.lower() for email in failed_batch}
+            retriable_failed: list[str] = []
+            for email in current_batch:
+                lowered = email.lower()
+                if lowered in success_set:
+                    continue
+                if lowered in failed_set:
+                    continue
+                retriable_failed.append(email)
             email_pool = retriable_failed + email_pool[active_count:]
             if not single_target_email:
                 save_email_pool(email_pool)
@@ -2838,9 +2916,7 @@ def run_booking_sender(
             consumed += len(successful_batch)
             scheduled += len(successful_batch)
             _progress(f"📊 Прогресс рассылки: {scheduled}/{total_input} отправлено")
-            if not successful_batch and failed_batch:
-                _progress("No successful bookings in this wave; stopping to avoid endless retry loop.")
-                break
+            # Continue with next emails even if this one failed.
 
             time.sleep(max(0, SEND_BETWEEN_BOOKINGS_SECONDS))
 
